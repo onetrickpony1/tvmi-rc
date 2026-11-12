@@ -10,8 +10,8 @@ A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt)
 ## Features
 
 - **One file, standard-library Python** with tkinter. `ffmpeg` is optional. A guided installer is included.
-- **Follow shows** by name, on TVM, TVM+ or either, first airing of the day or every airing. Or **record everything**
-  (news bulletins can be skipped).
+- **Schedules for every channel:** TVM, TVM+, TVMsport+, Magic, Radju Malta and Radju Malta 2. **Follow shows** by name, on one
+  channel or any, first airing of the day or every airing. Or **record all shows** on TVM and TVM+ (news bulletins can be skipped).
 - **Built-in recorder** that downloads the stream itself and backfills missed pieces, so a slow spell or short outage
   leaves no gap. If something is lost for good, a `- report.txt` next to the recording says what and when.
 - **Disk check** before every recording; optional `.mkv` conversion (needs ffmpeg).
@@ -54,7 +54,7 @@ or `%APPDATA%\TVMi Recorder\` (Windows). Recordings go to the folder set in the 
   without it the app assumes the PC clock is on Malta time.
 - The web page is reachable from your local network by default and only accepts local, private and Tailscale addresses.
   Set a password in Settings, or turn "reachable from the network" off, if others share your network.
-- Shows can only be followed on TVM and TVM+ (the only channels with a schedule page); TVMsport+ is recorded by hand.
+- "Record all shows" covers TVM and TVM+ only; follow radio, Magic or TVMsport+ shows by name. Magic's schedule page is usually empty.
 - The site is not an official API. It can change and break the app.
 
 ## Licence

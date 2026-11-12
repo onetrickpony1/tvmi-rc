@@ -48,10 +48,11 @@ except Exception:                      # no tz database (common on Windows): ass
 
 BASE = "https://tvmi.mt"
 UA = {"User-Agent": "Mozilla/5.0"}
-CHANNELS = {2: "TVM", 3: "TVM+", 4: "TVMsport+"}
-SCHEDULE_CHANNELS = (2, 3)
+CHANNELS = {2: "TVM", 3: "TVM+", 4: "TVMsport+", 5: "Magic", 6: "Radju Malta", 7: "Radju Malta 2"}
+SCHEDULE_CHANNELS = tuple(CHANNELS)             # every channel has a schedule page (Magic's is usually empty)
+ALL_SHOWS_CHANNELS = (2, 3)                     # "Record ALL shows" only covers the two main TV channels
 MAX_TRUSTED = dt.timedelta(minutes=120)   # longer gaps between listings are not treated as a show length
-SCHEDULE_VERSION = 2
+SCHEDULE_VERSION = 3
 IS_WIN = os.name == "nt"
 HOME = os.path.expanduser("~")
 
@@ -265,7 +266,7 @@ def resilience_opts(ffmpeg):
 
 
 def fetch_schedule(days_back=1, days_fwd=7):
-    """Programmes on TVM and TVM+ as dicts: ch, title, start, end (ISO strings).
+    """Programmes on every channel (TV and radio) as dicts: ch, title, start, end (ISO strings).
     The pages only give start times, so a programme ends when the next one starts."""
     out = []
     today = now().date()
@@ -1502,9 +1503,9 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
   <div class="row" style="margin-top:8px"><button class="b g" id="allbtn">● Record ALL shows: off</button>
    <select id="allday"><option value="first">First airing each day</option><option value="all">Every airing</option></select>
    <label class="chk" style="margin:0"><input type="checkbox" id="allnews"> Skip news bulletins</label></div>
-  <p class="mut" style="margin:8px 0 0">When on, every show on the TVM / TVM+ schedule is recorded, including ones that appear later. Shows you follow yourself keep their own settings.</p></div>
+  <p class="mut" style="margin:8px 0 0">When on, every show on the TVM and TVM+ schedules is recorded (not radio, Magic or TVMsport+), including ones that appear later. Shows you follow yourself keep their own settings.</p></div>
  <div class="cols">
-  <div class="card"><h2>Shows on TVM / TVM+ this week</h2>
+  <div class="card"><h2>Shows on the schedule this week</h2>
    <input id="q" type="search" placeholder="Search shows…"><div class="list" id="shows" style="margin-top:8px"></div></div>
   <div class="card"><h2>Shows you follow</h2><div class="list" id="follows"></div>
    <div class="row" style="margin-top:8px"><input class="grow" id="add" type="text" placeholder="Not listed? Type the exact name"><button class="b g" id="addb">Add</button></div></div>
@@ -1544,7 +1545,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 "use strict";
 const $=s=>document.querySelector(s);
 const ST={connecting:'connecting…',recording:'recording',paused:'paused',reconnecting:'reconnecting…',done:'finished'};
-const CH={2:'TVM',3:'TVM+',4:'TVMsport+'},CHF={0:'Any channel',2:'TVM only',3:'TVM+ only'},PD={first:'First airing each day',all:'Every airing'};
+const CH={2:'TVM',3:'TVM+',4:'TVMsport+',5:'Magic',6:'Radju Malta',7:'Radju Malta 2'},CHF={0:'Any channel',2:'TVM only',3:'TVM+ only',4:'TVMsport+ only',5:'Magic only',6:'Radju Malta only',7:'Radju Malta 2 only'},PD={first:'First airing each day',all:'Every airing'};
 let S=null,first=true,keyFollows='',keyShows='',tab='rec',tt;
 function h(tag,attrs,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(attrs||{})){if(k.startsWith('on'))e.addEventListener(k.slice(2),v);else if(v===true)e.setAttribute(k,'');else if(v!==false&&v!=null)e.setAttribute(k,v)}for(const c of kids.flat())if(c!=null)e.append(c instanceof Node?c:document.createTextNode(String(c)));return e}
 async function api(path,body){const r=await fetch('/api/'+path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||('Error '+r.status));return j}
@@ -1614,7 +1615,7 @@ DEFAULTS = {"engine": "hls", "out": os.path.join(HOME, "Videos"), "pre": 3, "pos
             "all": False, "all_per_day": "first", "all_skip_news": True}
 NEWS_RE = re.compile(r"a[ħh]bar|news", re.I)       # bulletins: "Record ALL shows" leaves these out unless told not to
 PER_DAY = {"first": "First airing each day", "all": "Every airing"}
-CH_FILTER = {0: "Any channel", 2: "TVM only", 3: "TVM+ only"}
+CH_FILTER = {0: "Any channel", **{n: f"{name} only" for n, name in CHANNELS.items()}}
 
 
 class App:
@@ -1791,14 +1792,14 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda e: self.all_changed())
         ttk.Checkbutton(allrow, text="Skip news bulletins", variable=self.v_all_news, command=self.all_changed).pack(side="left", padx=8)
         ttk.Label(f, foreground="gray40", wraplength=720, justify="left",
-                  text="When on, every show on the TVM / TVM+ schedule is recorded, including ones that appear later. "
+                  text="When on, every show on the TVM and TVM+ schedules is recorded (not radio, Magic or TVMsport+), including ones that appear later. "
                        "Shows you follow yourself keep their own settings."
                   ).pack(anchor="w", pady=(4, 0))
         cols = ttk.Frame(f)
         cols.pack(fill="both", expand=True, pady=8)
         cols.columnconfigure((0, 2), weight=1, uniform="c")
         cols.rowconfigure(1, weight=1)
-        ttk.Label(cols, text="Shows on TVM / TVM+ this week").grid(row=0, column=0, sticky="w")
+        ttk.Label(cols, text="Shows on the schedule this week").grid(row=0, column=0, sticky="w")
         ttk.Label(cols, text="Shows you follow").grid(row=0, column=2, sticky="w")
         left = ttk.Frame(cols)
         left.grid(row=1, column=0, sticky="nsew")
@@ -1823,7 +1824,7 @@ class App:
         self.ftree.bind("<<TreeviewSelect>>", lambda e: self.follow_selected_changed())
         opt = ttk.Frame(right)
         opt.pack(fill="x", pady=(6, 0))
-        self.c_fch = ttk.Combobox(opt, textvariable=self.v_fch, values=list(CH_FILTER.values()), state="readonly", width=14)
+        self.c_fch = ttk.Combobox(opt, textvariable=self.v_fch, values=list(CH_FILTER.values()), state="readonly", width=18)
         self.c_fday = ttk.Combobox(opt, textvariable=self.v_fday, values=list(PER_DAY.values()), state="readonly", width=20)
         self.c_fch.pack(side="left")
         self.c_fday.pack(side="left", padx=6)
@@ -1858,7 +1859,7 @@ class App:
         f.columnconfigure(1, weight=1)
         ttk.Label(f, text="Channel").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Combobox(f, textvariable=self.v_ch, values=[self.ch_label(n) for n in CHANNELS], state="readonly",
-                     width=14).grid(row=0, column=1, sticky="w")
+                     width=18).grid(row=0, column=1, sticky="w")
         ttk.Label(f, text="Stop after").grid(row=1, column=0, sticky="w", pady=4)
         d = ttk.Frame(f)
         d.grid(row=1, column=1, sticky="w")
@@ -2117,7 +2118,7 @@ class App:
         rows = []
         for it in self.sched:
             f = fl.get(norm(it["title"]))                    # a show you follow keeps its own settings
-            if not f and all_on and not (skip_news and NEWS_RE.search(it["title"])):
+            if not f and all_on and it["ch"] in ALL_SHOWS_CHANNELS and not (skip_news and NEWS_RE.search(it["title"])):
                 f = {"title": it["title"], "channel": 0, "per_day": all_day}     # "Record ALL shows"
             if not f or (f["channel"] and f["channel"] != it["ch"]):
                 continue

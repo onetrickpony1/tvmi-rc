@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Schedule pages for every channel: TVM, TVM+, TVMsport+, Magic, Radju Malta and Radju Malta 2. Shows on any of them can be followed.
+
 ## 1.0.0 — 2026-11-12
 
 First public version.
