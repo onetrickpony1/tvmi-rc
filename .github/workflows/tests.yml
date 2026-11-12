@@ -1,0 +1,20 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m py_compile tvmi-recorder.py
+      - name: imports cleanly
+        run: python -c "import importlib.util as u; s=u.spec_from_file_location('m','tvmi-recorder.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"

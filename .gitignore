@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.ts
+*.mkv
+*.log
+tvmi-recorder-settings.json
