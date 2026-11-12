@@ -21,12 +21,15 @@ function Ask($q, $default) {
 function Refresh-Path {
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
 }
+function Try-Py($exe, [string[]]$pyargs) {   # run Python quietly; true if it exited 0 (stderr is not an error here)
+    $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    try { & $exe @pyargs *> $null; return ($LASTEXITCODE -eq 0) } finally { $ErrorActionPreference = $old }
+}
 function Find-Python {
     foreach ($c in @("py", "python")) {
         $cmd = Get-Command $c -ErrorAction SilentlyContinue
         if ($cmd -and ($cmd.Source -notmatch "WindowsApps")) {
-            & $cmd.Source -c "import tkinter" 2>$null
-            if ($LASTEXITCODE -eq 0) { return $cmd.Source }
+            if (Try-Py $cmd.Source @("-c", "import tkinter")) { return $cmd.Source }
         }
     }
     return $null
@@ -55,8 +58,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command wi
 }
 
 # 3. tzdata (recommended: Windows has no time-zone data for Python)
-& $py -c "import zoneinfo; zoneinfo.ZoneInfo('Europe/Malta')" 2>$null
-if ($LASTEXITCODE -ne 0) {
+if (-not (Try-Py $py @("-c", "import zoneinfo; zoneinfo.ZoneInfo('Europe/Malta')"))) {
     if (Ask "Schedule times are Maltese time. Install the small 'tzdata' package so daylight saving is always right? [Y/n]" "y") {
         & $py -m pip install --user --quiet tzdata
     }
@@ -68,8 +70,7 @@ New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $target = Join-Path $Dir "tvmi-recorder.pyw"
 if ($env:TVMI_RC_SOURCE -and (Test-Path $env:TVMI_RC_SOURCE)) { Copy-Item $env:TVMI_RC_SOURCE $target -Force }
 else { Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $target }
-& $py -m py_compile $target
-if ($LASTEXITCODE -ne 0) { throw "the downloaded file is not valid Python" }
+if (-not (Try-Py $py @("-m", "py_compile", $target))) { throw "the downloaded file is not valid Python" }
 
 # 5. Start menu shortcut
 if (-not $env:CI -and (Ask "Add 'TVMi Recorder' to the Start menu? [Y/n]" "y")) {
