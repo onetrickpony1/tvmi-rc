@@ -18,3 +18,29 @@ jobs:
       - run: python -m py_compile tvmi-recorder.py
       - name: imports cleanly
         run: python -c "import importlib.util as u; s=u.spec_from_file_location('m','tvmi-recorder.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TVMI_RC_SOURCE: ${{ github.workspace }}/tvmi-recorder.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          sh install.sh
+          test -x "$HOME/.local/bin/tvmi-rc"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy ByPass -File install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path "$env:LOCALAPPDATA\tvmi-rc\tvmi-recorder.pyw")) { exit 1 }

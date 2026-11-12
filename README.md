@@ -1,7 +1,7 @@
 # tvmi-rc
 
-A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt) (TVM, TVM+ and TVMsport+). Record by hand, or
-**follow shows**: it reads the TVM / TVM+ schedule, waits for each airing (a little early, a little late) and records it.
+A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt): **TVM, TVM+ and TVMsport+**. Record by hand, or
+**follow shows**: it reads the TVM and TVM+ schedule, waits for each airing (a little early, a little late) and records it.
 
 > **Legal notice.** tvmi-rc is for personal, private use, such as time-shifting a free broadcast you could watch live. Respect
 > the broadcaster's terms and copyright law; you alone are responsible for what you record and what you do with it. No
@@ -9,7 +9,7 @@ A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt)
 
 ## Features
 
-- **One file, no installs.** Standard-library Python with tkinter. `ffmpeg` is optional.
+- **One file, standard-library Python** with tkinter. `ffmpeg` is optional. A guided installer is included.
 - **Follow shows** by name, on TVM, TVM+ or either, first airing of the day or every airing. Or **record everything**
   (news bulletins can be skipped).
 - **Built-in recorder** that downloads the stream itself and backfills missed pieces, so a slow spell or short outage
@@ -20,19 +20,29 @@ A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt)
 - **Debug log**, settings export / import, start at login.
 - **Linux and Windows** (macOS is untested).
 
-## Install and run
+## Install
 
-Needs Python 3.10 or newer with tkinter (included with Python on Windows; on Linux, e.g. `python3-tk`).
+One line, no admin rights needed. It checks for Python with tkinter (required), ffmpeg (optional) and, on Windows, the
+time-zone package, and **asks before installing anything that is missing**. It then saves the app, adds a `tvmi-rc` command
+and offers a menu icon.
 
+**Windows** (PowerShell):
 ```
-python3 tvmi-recorder.py
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/install.ps1 | iex"
 ```
 
-On Windows, double-click it, or rename it to `.pyw` for no console window. To use the optional ffmpeg engine or the `.mkv`
-option, install ffmpeg or put `ffmpeg` next to the script.
+**Linux and macOS** (Terminal):
+```
+curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/install.sh | sh
+```
 
-Settings, followed shows and the log live in `~/.config/tvmi-recorder/` (Linux) or `%APPDATA%\TVMi Recorder\` (Windows).
-Recordings go to the folder set in the Settings tab (default `~/Videos`):
+Run the same line again to update. Or skip the installer: it is one file, so `python3 tvmi-recorder.py` works wherever
+Python 3.10+ with tkinter is installed.
+
+## Use
+
+Start it from the menu, or run `tvmi-rc`. Settings, followed shows and the log live in `~/.config/tvmi-recorder/` (Linux)
+or `%APPDATA%\TVMi Recorder\` (Windows). Recordings go to the folder set in the Settings tab (default `~/Videos`):
 
 ```
 <folder>/<Show>/<Show> - 2026-11-12 2030.ts
@@ -44,6 +54,7 @@ Recordings go to the folder set in the Settings tab (default `~/Videos`):
   without it the app assumes the PC clock is on Malta time.
 - The web page is reachable from your local network by default and only accepts local, private and Tailscale addresses.
   Set a password in Settings, or turn "reachable from the network" off, if others share your network.
+- Shows can only be followed on TVM and TVM+ (the only channels with a schedule page); TVMsport+ is recorded by hand.
 - The site is not an official API. It can change and break the app.
 
 ## Licence
