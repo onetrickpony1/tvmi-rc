@@ -5,11 +5,11 @@
 #
 # It checks what is missing and asks before installing anything:
 #   1. Python 3 with tkinter (needed)       2. ffmpeg (optional)
-# then saves tvmi-recorder.py to ~/.local/share/tvmi-rc, adds a `tvmi-rc` command and offers a menu/desktop icon.
+# then saves tvmi-rc.py to ~/.local/share/tvmi-rc, adds a `tvmi-rc` command and offers a menu/desktop icon.
 # Run it again to update. Uninstall: delete ~/.local/share/tvmi-rc and ~/.local/bin/tvmi-rc.
 set -eu
 
-URL="${TVMI_RC_URL:-https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/tvmi-recorder.py}"
+URL="${TVMI_RC_URL:-https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/tvmi-rc.py}"
 DIR="$HOME/.local/share/tvmi-rc"
 BIN="$HOME/.local/bin"
 
@@ -63,15 +63,21 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 # 3. the app
-say "Downloading tvmi-recorder.py"
+say "Downloading tvmi-rc.py"
 mkdir -p "$DIR" "$BIN"
-if [ -f "${TVMI_RC_SOURCE:-}" ]; then cp "$TVMI_RC_SOURCE" "$DIR/tvmi-recorder.py"
-elif command -v curl >/dev/null 2>&1; then curl -LsSf "$URL" -o "$DIR/tvmi-recorder.py"
-elif command -v wget >/dev/null 2>&1; then wget -qO "$DIR/tvmi-recorder.py" "$URL"
+if [ -f "${TVMI_RC_SOURCE:-}" ]; then cp "$TVMI_RC_SOURCE" "$DIR/tvmi-rc.py"
+elif command -v curl >/dev/null 2>&1; then curl -LsSf "$URL" -o "$DIR/tvmi-rc.py"
+elif command -v wget >/dev/null 2>&1; then wget -qO "$DIR/tvmi-rc.py" "$URL"
 else fail "needs curl or wget to download the app"
 fi
-python3 -m py_compile "$DIR/tvmi-recorder.py" || fail "the downloaded file is not valid Python"
-printf '#!/bin/sh\nexec python3 "%s/tvmi-recorder.py" "$@"\n' "$DIR" > "$BIN/tvmi-rc"
+python3 -m py_compile "$DIR/tvmi-rc.py" || fail "the downloaded file is not valid Python"
+printf '#!/bin/sh\nexec python3 "%s/tvmi-rc.py" "$@"\n' "$DIR" > "$BIN/tvmi-rc"
+# Older versions saved the app as tvmi-recorder.py: remove it, and point "start at login" at the new file.
+rm -f "$DIR/tvmi-recorder.py"
+AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/tvmi-recorder.desktop"
+if [ -f "$AUTOSTART" ]; then
+    sed 's|/tvmi-recorder\.py"|/tvmi-rc.py"|' "$AUTOSTART" > "$AUTOSTART.tmp" && mv "$AUTOSTART.tmp" "$AUTOSTART"
+fi
 chmod +x "$BIN/tvmi-rc"
 
 # 4. menu icon

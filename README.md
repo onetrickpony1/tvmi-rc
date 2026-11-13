@@ -1,7 +1,8 @@
 # tvmi-rc
 
-A small desktop app that records the live channels of [tvmi.mt](https://tvmi.mt): **TVM, TVM+ and TVMsport+**. Record by hand, or
-**follow shows**: it reads the TVM and TVM+ schedule, waits for each airing (a little early, a little late) and records it.
+A small desktop app that records the live TV and radio channels of [tvmi.mt](https://tvmi.mt): TVM, TVM+, TVMsport+, Magic,
+Radju Malta and Radju Malta 2. Record by hand, or follow shows: it reads each channel's schedule, waits for each airing (a
+little early, a little late) and records it.
 
 > **Legal notice.** tvmi-rc is for personal, private use, such as time-shifting a free broadcast you could watch live. Respect
 > the broadcaster's terms and copyright law; you alone are responsible for what you record and what you do with it. No
@@ -36,7 +37,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/one
 curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/install.sh | sh
 ```
 
-Run the same line again to update. Or skip the installer: it is one file, so `python3 tvmi-recorder.py` works wherever
+Run the same line again to update. Or skip the installer: it is one file, so `python3 tvmi-rc.py` works wherever
 Python 3.10+ with tkinter is installed.
 
 ## Use
@@ -57,6 +58,6 @@ or `%APPDATA%\TVMi Recorder\` (Windows). Recordings go to the folder set in the 
 - "Record all shows" covers TVM and TVM+ only; follow radio, Magic or TVMsport+ shows by name. Magic's schedule page is usually empty.
 - The site is not an official API. It can change and break the app.
 
-## Licence
+## License
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

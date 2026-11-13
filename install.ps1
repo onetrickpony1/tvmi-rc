@@ -4,11 +4,11 @@
 #
 # It checks what is missing and asks before installing anything:
 #   1. Python 3 (needed)   2. ffmpeg (optional)   3. tzdata, so daylight saving is right on any PC (recommended)
-# then saves tvmi-recorder.py to %LOCALAPPDATA%\tvmi-rc and offers a Start menu shortcut.
+# then saves tvmi-rc.py to %LOCALAPPDATA%\tvmi-rc and offers a Start menu shortcut.
 # Run it again to update. Uninstall: delete that folder and the shortcut.
 $ErrorActionPreference = "Stop"
 
-$Url = if ($env:TVMI_RC_URL) { $env:TVMI_RC_URL } else { "https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/tvmi-recorder.py" }
+$Url = if ($env:TVMI_RC_URL) { $env:TVMI_RC_URL } else { "https://raw.githubusercontent.com/onetrickpony1/tvmi-rc/main/tvmi-rc.py" }
 $Dir = Join-Path $env:LOCALAPPDATA "tvmi-rc"
 
 function Say($m) { Write-Host "`n==> $m" }
@@ -65,12 +65,23 @@ if (-not (Try-Py $py @("-c", "import zoneinfo; zoneinfo.ZoneInfo('Europe/Malta')
 }
 
 # 4. the app
-Say "Downloading tvmi-recorder.py"
+Say "Downloading tvmi-rc.py"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-$target = Join-Path $Dir "tvmi-recorder.pyw"
+$target = Join-Path $Dir "tvmi-rc.pyw"
 if ($env:TVMI_RC_SOURCE -and (Test-Path $env:TVMI_RC_SOURCE)) { Copy-Item $env:TVMI_RC_SOURCE $target -Force }
 else { Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $target }
 if (-not (Try-Py $py @("-m", "py_compile", $target))) { throw "the downloaded file is not valid Python" }
+
+# Older versions saved the app as tvmi-recorder.pyw: remove it, and point "start at login" and the Start menu shortcut at the new file.
+$old = Join-Path $Dir "tvmi-recorder.pyw"
+if (Test-Path $old) { Remove-Item $old -Force }
+$bat = Join-Path ([Environment]::GetFolderPath("Startup")) "TVMi Recorder.bat"
+if (Test-Path $bat) { (Get-Content $bat -Raw).Replace("tvmi-recorder.pyw", "tvmi-rc.pyw") | Set-Content $bat -NoNewline -Encoding Ascii }
+$oldLnk = Join-Path ([Environment]::GetFolderPath("Programs")) "TVMi Recorder.lnk"
+if (Test-Path $oldLnk) {
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($oldLnk)
+    if ($s.Arguments -like "*tvmi-recorder.pyw*") { $s.Arguments = "`"$target`""; $s.Save() }
+}
 
 # 5. Start menu shortcut
 if (-not $env:CI -and (Ask "Add 'TVMi Recorder' to the Start menu? [Y/n]" "y")) {

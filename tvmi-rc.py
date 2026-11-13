@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""TVMI Recorder — record live TVMI channels (tvmi.mt/live/N), by hand or automatically.
+"""TVMi Recorder (tvmi-rc): record live TVMi channels (tvmi.mt/live/N), by hand or automatically.
 
-Follow shows and it reads the TVM / TVM+ schedule, waits for each airing (a little early
-to a little late), and records it. Manual recording is still there too.
+Follow shows and it reads the schedule of every channel (TV and radio), waits for each airing
+(a little early to a little late), and records it. Manual recording is still there too.
 Works on Linux and Windows. Needs: Python 3 with tkinter, and ffmpeg (on PATH, or
 ffmpeg / ffmpeg.exe placed next to this file). No hard-coded paths: safe to move anywhere.
 Settings, followed shows and history live in the user's config folder.
@@ -185,7 +185,7 @@ def find_ffmpeg():
     return None
 
 
-# ------------------------------------------------------------------ TVMI access
+# ------------------------------------------------------------------ TVMi access
 def _has_certifi():
     try:
         import certifi  # noqa: F401
@@ -1021,7 +1021,7 @@ def set_autostart(on):
     else:
         p = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
                          "autostart", "tvmi-recorder.desktop")
-        text = ("[Desktop Entry]\nType=Application\nName=TVMI Recorder\nTerminal=false\n"
+        text = ("[Desktop Entry]\nType=Application\nName=TVMi Recorder\nTerminal=false\n"
                 f'Exec={sys.executable} "{script}" --minimized\n')
     try:
         if on:
@@ -1329,7 +1329,7 @@ class WebServer:
                     self.send(200, {"text": tail_log()})
                 elif path == "/api/export":
                     code, res = call_ui(app, app.export_dict)
-                    self.send(code, res, extra=[("Content-Disposition", 'attachment; filename="tvmi-recorder-settings.json"')])
+                    self.send(code, res, extra=[("Content-Disposition", 'attachment; filename="tvmi-rc-settings.json"')])
                 else:
                     self.send(404, {"error": "Not found"})
 
@@ -1621,7 +1621,7 @@ CH_FILTER = {0: "Any channel", **{n: f"{name} only" for n, name in CHANNELS.item
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("TVMI Recorder")
+        root.title("TVMi Recorder")
         root.minsize(760, 640)
         self.ffmpeg = find_ffmpeg()
         self.q = queue.Queue()          # worker threads hand results to the Tk thread through this
@@ -1683,7 +1683,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close)
 
         if not self.ffmpeg and self.v_ffmpeg_engine.get():
-            messagebox.showwarning("TVMI Recorder", "ffmpeg wasn't found.\n\nInstall it (Windows: winget install ffmpeg; "
+            messagebox.showwarning("TVMi Recorder", "ffmpeg wasn't found.\n\nInstall it (Windows: winget install ffmpeg; "
                                    "Linux: your package manager) or put ffmpeg next to this file, then restart.")
         if self.v_login.get():
             set_autostart(True)
@@ -1836,7 +1836,7 @@ class App:
         ttk.Entry(add, textvariable=self.v_add, width=30).pack(side="left", padx=6)
         ttk.Button(add, text="Add", command=self.add_typed).pack(side="left")
         ttk.Label(f, foreground="gray40", wraplength=720, justify="left",
-                  text="TVMI doesn't say which airings are repeats, so “First airing each day” records only the first "
+                  text="TVMi doesn't say which airings are repeats, so “First airing each day” records only the first "
                        "time a show appears on a given date; choose “Every airing” (or a single channel) to change that."
                   ).pack(anchor="w", pady=(8, 0))
 
@@ -2494,12 +2494,12 @@ class App:
         ok, msg = self.begin_manual(self.channel_num(self.v_ch.get()),
                                     self.num(self.v_h, 0) * 3600 + self.num(self.v_m, 0) * 60, self.v_name.get())
         if not ok:
-            messagebox.showerror("TVMI Recorder", msg)
+            messagebox.showerror("TVMi Recorder", msg)
 
     def start_test(self):
         ok, msg = self.begin_test(self.channel_num(self.v_ch.get()))
         if not ok:
-            messagebox.showerror("TVMI Recorder", msg)
+            messagebox.showerror("TVMi Recorder", msg)
 
     def check_test(self, job):
         """Report whether the test produced a playable file."""
@@ -2529,7 +2529,7 @@ class App:
             live = [j for j in self.jobs if j.state != "done"]
             if len(live) == 1:
                 return live[0]
-            messagebox.showinfo("TVMI Recorder", "Click the recording you mean in the list first."
+            messagebox.showinfo("TVMi Recorder", "Click the recording you mean in the list first."
                                 if live else "Nothing is recording right now.")
         return job
 
@@ -2556,20 +2556,20 @@ class App:
 
     def export_settings(self):
         path = filedialog.asksaveasfilename(
-            title="Export settings", defaultextension=".json", initialfile="tvmi-recorder-settings.json",
+            title="Export settings", defaultextension=".json", initialfile="tvmi-rc-settings.json",
             filetypes=[("Settings file", "*.json")])
         if not path:
             return
         try:
             save_json(path, self.export_dict())
         except OSError as e:
-            return messagebox.showerror("TVMI Recorder", f"Couldn't write the file:\n{e}")
+            return messagebox.showerror("TVMi Recorder", f"Couldn't write the file:\n{e}")
         self.log(f"Exported settings and {len(self.follows)} followed show(s) to {path}")
 
     def apply_import(self, d):
         """Load an exported settings dict. Returns (ok, message, note)."""
         if not isinstance(d, dict) or d.get("app") != "tvmi-recorder":
-            return False, "That isn't a TVMI Recorder settings file.", ""
+            return False, "That isn't a TVMi Recorder settings file.", ""
         s = dict(DEFAULTS)
         s.update({k: v for k, v in d.get("s", {}).items() if k not in WEB_KEYS})
         try:
@@ -2616,14 +2616,14 @@ class App:
             return
         d = load_json(path, None)
         if not isinstance(d, dict) or d.get("app") != "tvmi-recorder":
-            return messagebox.showerror("TVMI Recorder", "That isn't a TVMI Recorder settings file.")
-        if not messagebox.askyesno("TVMI Recorder", "Replace your current settings and followed shows with the ones in this file?"):
+            return messagebox.showerror("TVMi Recorder", "That isn't a TVMi Recorder settings file.")
+        if not messagebox.askyesno("TVMi Recorder", "Replace your current settings and followed shows with the ones in this file?"):
             return
         ok, msg, note = self.apply_import(d)
         if not ok:
-            messagebox.showerror("TVMI Recorder", msg)
+            messagebox.showerror("TVMi Recorder", msg)
         elif note:
-            messagebox.showinfo("TVMI Recorder", note + "\n\nChange it in Settings if you like.")
+            messagebox.showinfo("TVMi Recorder", note + "\n\nChange it in Settings if you like.")
 
     # ---------- web control
     def drain_queue(self):
@@ -2870,7 +2870,7 @@ class App:
 
     def close(self):
         if any(j.state != "done" for j in self.jobs) and not messagebox.askyesno(
-                "TVMI Recorder", "Recordings are running. Stop them and quit?"):
+                "TVMi Recorder", "Recordings are running. Stop them and quit?"):
             return
         running = sum(1 for j in self.jobs if j.state != "done" and not j.test)
         for j in self.jobs:

@@ -4,6 +4,7 @@ __pycache__/
 *.ts
 *.mkv
 *.log
+tvmi-rc-settings.json
 tvmi-recorder-settings.json
 settings.json
 *.webhook
