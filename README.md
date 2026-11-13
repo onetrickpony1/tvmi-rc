@@ -16,7 +16,8 @@ little early, a little late) and records it.
 - **Built-in recorder** that downloads the stream itself and backfills missed pieces, so a slow spell or short outage
   leaves no gap. If something is lost for good, a `- report.txt` next to the recording says what and when.
 - **Disk check** before every recording; optional `.mkv` conversion (needs ffmpeg).
-- **Web page** for your phone or another PC on your network or Tailscale (default port 9001, optional password).
+- **Web page** on this computer, and on your phone or another PC over your network or Tailscale once you allow it
+  (default port 9001, password needed from other devices).
 - **Discord notifications** (started, finished, dropped, failed) through a webhook you provide.
 - **Debug log**, settings export / import, start at login.
 - **Linux and Windows** (macOS is untested).
@@ -53,8 +54,11 @@ or `%APPDATA%\TVMi Recorder\` (Windows). Recordings go to the folder set in the 
 
 - Schedule times are Maltese local time. With time-zone data (`pip install tzdata` on Windows) daylight saving is handled;
   without it the app assumes the PC clock is on Malta time.
-- The web page is reachable from your local network by default and only accepts local, private and Tailscale addresses.
-  Set a password in Settings, or turn "reachable from the network" off, if others share your network.
+- The web page only answers this computer until you tick "Let other devices on my network / Tailscale connect" in
+  Settings. Other devices then need the password, which is made for you if you leave it blank. Public internet
+  addresses are always refused. The password travels unencrypted over your network, so on a shared network, prefer
+  Tailscale.
+- Only one copy of the app runs at a time. Opening it again brings the running copy's window to the front.
 - "Record all shows" covers TVM and TVM+ only; follow radio, Magic or TVMsport+ shows by name. Magic's schedule page is usually empty.
 - The site is not an official API. It can change and break the app.
 

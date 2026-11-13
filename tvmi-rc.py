@@ -25,6 +25,7 @@ import shutil
 import signal
 import socket
 import statistics
+import secrets
 import ssl
 import subprocess
 import sys
@@ -73,6 +74,8 @@ CFG = cfg_dir()
 SETTINGS_FILE = os.path.join(CFG, "settings.json")
 SCHEDULE_FILE = os.path.join(CFG, "schedule.json")
 LOG_FILE = os.path.join(CFG, "tvmi-recorder.log")
+LOCK_FILE = os.path.join(CFG, "running.lock")
+RAISE_FILE = os.path.join(CFG, "show-window")      # touched by a second copy: the running one shows its window
 
 # Debug log: every message shown in the window, plus ffmpeg's own messages, exit codes, network
 # probes and errors. Rotates at 2 MB (keeps 3 old files). Session tokens are always blanked out.
@@ -133,9 +136,54 @@ def norm(title):
     return re.sub(r"\s+", " ", title).strip().casefold()
 
 
-def safe_name(s):
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+
+
+def safe_name(s, limit=100):
+    """A file or folder name that works on Windows, macOS and Linux. Long titles are cut, so the whole path stays
+    well inside Windows' 260-character limit."""
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s).strip(" .")
+    s = s[:limit].rstrip(" .")
+    if s.split(".")[0].strip().upper() in _RESERVED:      # "Aux" or "con.txt" can't be a name on Windows
+        s = "_" + s
     return s or "recording"
+
+
+def clean_follows(raw, channels=None):
+    """Followed shows from a settings file: well-formed, and each show once (by its normalised title). A file with
+    "Xarabank" and "xarabank " used to stop the app from starting."""
+    channels = channels or {0, *CHANNELS}
+    out, seen = [], set()
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict) or not isinstance(f.get("title"), str) or not f["title"].strip():
+            continue
+        title = " ".join(f["title"].split())
+        if norm(title) in seen:
+            continue
+        seen.add(norm(title))
+        ch = f.get("channel", 0)
+        out.append({"title": title, "channel": ch if isinstance(ch, int) and ch in channels else 0,
+                    "per_day": f.get("per_day") if f.get("per_day") in ("first", "all") else "first"})
+    return out
+
+
+def run_bounded(fn, timeout, what="the save folder"):
+    """Run fn in a helper thread and wait at most `timeout` seconds. A network drive that has hung (after sleep, or
+    a dropped VPN) can block a disk call for minutes, and the window's thread is also the scheduler."""
+    box, done = {}, threading.Event()
+
+    def work():
+        try:
+            box["ok"] = fn()
+        except BaseException as e:
+            box["err"] = e
+        done.set()
+    threading.Thread(target=work, daemon=True).start()
+    if not done.wait(timeout):
+        raise OSError(f"{what} isn't responding (a disconnected network drive?)")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
 
 
 def portable_path(p):
@@ -183,6 +231,151 @@ def find_ffmpeg():
         if cand and os.path.isfile(cand):
             return cand
     return None
+
+
+def find_ffprobe(ffmpeg):
+    """ffprobe on PATH, or next to ffmpeg."""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    if ffmpeg:
+        cand = os.path.join(os.path.dirname(ffmpeg), "ffprobe" + (".exe" if IS_WIN else ""))
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def media_duration(ffprobe, path, timeout=60):
+    """Seconds of media in a file, or None if it can't be measured."""
+    if not ffprobe:
+        return None
+    try:
+        r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                           **({"creationflags": 0x08000000} if IS_WIN else {}))
+        return float(r.stdout.strip())
+    except Exception:
+        return None
+
+
+def conversion_ok(ffprobe, src, dst):
+    """Is the .mkv a complete copy of the .ts? Compares lengths with ffprobe. File sizes can't tell: Matroska drops
+    MPEG-TS's packet overhead, so a good radio .mkv is often only 80% of the .ts."""
+    if not os.path.isfile(dst) or os.path.getsize(dst) == 0:
+        return False
+    a, b = media_duration(ffprobe, src), media_duration(ffprobe, dst)
+    if a and b:
+        return b >= a * 0.97 - 2
+    return os.path.getsize(dst) >= 0.5 * os.path.getsize(src)   # no ffprobe: only catch a clearly truncated file
+
+
+class InstanceLock:
+    """Only one copy of the app may run: two copies record every followed show twice and overwrite each other's
+    settings. The lock is an OS file lock, so it goes away by itself if the app crashes."""
+
+    def __init__(self, path):
+        self.path, self.fh = path, None
+
+    def acquire(self):
+        fh = open(self.path, "a+")
+        try:
+            if IS_WIN:
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self.fh = fh
+        return True
+
+    def release(self):
+        if self.fh:
+            try:
+                if IS_WIN:
+                    import msvcrt
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            self.fh.close()
+            self.fh = None
+
+
+def _child_dies_with_parent():
+    """preexec_fn for ffmpeg on Linux: ffmpeg gets SIGTERM (it then closes the file properly) if this app dies,
+    instead of recording on for ever with nobody to stop it."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except Exception:
+        return None
+    parent = os.getpid()
+
+    def fn():
+        prctl(1, signal.SIGTERM)                 # PR_SET_PDEATHSIG
+        if os.getppid() != parent:               # the app died before prctl took effect
+            os.kill(os.getpid(), signal.SIGTERM)
+    return fn
+
+
+class _WinKillJob:
+    """A Windows Job Object that kills the processes in it when this app exits, however it exits."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", IoCounters), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+        self.k32 = k32
+        self.handle = k32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObject failed")
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000                            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+
+    def add(self, proc):
+        return bool(self.k32.AssignProcessToJobObject(self.handle, int(proc._handle)))
+
+
+_KILL_JOB = []
+
+
+def tie_to_app(proc):
+    """Windows: put a child process in the app's kill-on-exit job (Linux uses _child_dies_with_parent)."""
+    if not IS_WIN:
+        return
+    try:
+        if not _KILL_JOB:
+            _KILL_JOB.append(_WinKillJob())
+        if not _KILL_JOB[0].add(proc):
+            dlog("couldn't tie ffmpeg to the app (it may keep running if the app is killed)", logging.WARNING)
+    except Exception as e:
+        dlog(f"couldn't tie ffmpeg to the app: {e}", logging.WARNING)
 
 
 # ------------------------------------------------------------------ TVMi access
@@ -265,31 +458,58 @@ def resilience_opts(ffmpeg):
     return opts
 
 
-def fetch_schedule(days_back=1, days_fwd=7):
-    """Programmes on every channel (TV and radio) as dicts: ch, title, start, end (ISO strings).
-    The pages only give start times, so a programme ends when the next one starts."""
-    out = []
+MAIN_CHANNELS = (2, 3)       # a refresh that got nothing for these two is a failed refresh
+
+
+def parse_schedule_page(page, day):
+    """[(start datetime, title), ...] from one channel's schedule page for `day`."""
+    out, last, add = [], -1, 0
+    for blk in (page or "").split('class="flex-1 -mt-1"')[1:]:
+        t = re.search(r'font-light">\s*(\d\d):(\d\d)', blk)
+        title = re.search(r'line-clamp-1">\s*(.*?)\s*<', blk, re.S)
+        if not (t and title):
+            continue
+        mins = int(t[1]) * 60 + int(t[2])
+        if mins < last:
+            add = 1                       # listed after midnight, belongs to the next date
+        last = mins
+        start = dt.datetime.combine(day + dt.timedelta(add), dt.time(mins // 60, mins % 60), tzinfo=TZ)
+        out.append((start, " ".join(html.unescape(title.group(1)).split())))
+    return out
+
+
+def fetch_schedule(days_back=1, days_fwd=7, timeout=15):
+    """Programmes on every channel (TV and radio) as dicts: ch, title, start, end (ISO strings), plus the
+    (channel, date) pages that couldn't be loaded. One failed page no longer throws the whole refresh away: only a
+    refresh that got nothing at all for TVM and TVM+ counts as failed."""
+    pages, failed, last_err = {}, set(), None
     today = now().date()
     for ch in SCHEDULE_CHANNELS:
         seq = {}
         for off in range(-days_back, days_fwd + 1):
             day = today + dt.timedelta(off)
-            page = fetch(f"/schedule/{ch}/{day}")
+            try:
+                page = fetch(f"/schedule/{ch}/{day}", timeout)
+            except Exception as e:
+                failed.add((ch, day.isoformat()))
+                last_err = e
+                dlog(f"schedule: channel {ch}, {day}: {type(e).__name__}: {e}", logging.WARNING)
+                page = None
             time.sleep(0.2)
-            if not page:
-                continue
-            last, add = -1, 0
-            for blk in page.split('class="flex-1 -mt-1"')[1:]:
-                t = re.search(r'font-light">\s*(\d\d):(\d\d)', blk)
-                title = re.search(r'line-clamp-1">\s*(.*?)\s*<', blk, re.S)
-                if not (t and title):
-                    continue
-                mins = int(t[1]) * 60 + int(t[2])
-                if mins < last:
-                    add = 1                       # listed after midnight, belongs to the next date
-                last = mins
-                start = dt.datetime.combine(day + dt.timedelta(add), dt.time(mins // 60, mins % 60), tzinfo=TZ)
-                seq[start] = " ".join(html.unescape(title.group(1)).split())
+            for start, title in parse_schedule_page(page, day):
+                seq[start] = title
+        pages[ch] = seq
+    days = days_back + days_fwd + 1
+    if all(sum(1 for c, _ in failed if c == ch) == days for ch in MAIN_CHANNELS):
+        raise last_err or RuntimeError("no schedule pages could be loaded")
+    return schedule_items(pages), failed
+
+
+def schedule_items(pages):
+    """{ch: {start: title}} -> programme dicts. The pages only give start times, so a programme ends when the
+    next one starts."""
+    out = []
+    for ch, seq in pages.items():
         starts = sorted(seq)
         for i, st in enumerate(starts):
             nxt = starts[i + 1] if i + 1 < len(starts) else None
@@ -312,6 +532,15 @@ def fetch_schedule(days_back=1, days_fwd=7):
         res.append({"ch": x["ch"], "title": x["title"], "start": x["start"].isoformat(),
                     "end": (x["start"] + length).isoformat(), "guess": guess})
     return res
+
+
+def merge_schedule(new, old, failed):
+    """Keep the previous listings for pages that failed this time, so a flaky page doesn't hide a followed show."""
+    if not failed:
+        return list(new)
+    have = {(x["ch"], x["start"][:10]) for x in new}
+    kept = [x for x in old if (x["ch"], x["start"][:10]) in failed and (x["ch"], x["start"][:10]) not in have]
+    return sorted(list(new) + kept, key=lambda x: (x["start"], x["ch"]))
 
 
 # ------------------------------------------------------------------ built-in recorder
@@ -349,6 +578,32 @@ def parse_media_playlist(text):
         elif line and not line.startswith("#"):
             segs.append((seq + len(segs), line, dur))
     return segs
+
+
+def seq_pattern(seq, uri):
+    """'chunk_{seq}.ts' from chunk 1234's uri 'chunk_1234.ts', so chunks that left the playlist can be asked for by
+    number. None if the number isn't in the uri."""
+    s = str(seq)
+    if s not in uri:
+        return None
+    i = uri.rfind(s)
+    return uri[:i] + "{seq}" + uri[i + len(s):]
+
+
+def seq_uri(pattern, seq):
+    return pattern.replace("{seq}", str(seq)) if pattern else None
+
+
+def jump_todo(segs, pattern, since, walk_back):
+    """After the chunk numbering jumped: the chunks to take from the new stream. Covers the time since the last chunk
+    was written (`since` seconds, plus one chunk), using the playlist and, if that isn't enough, older chunks found
+    with walk_back(oldest listed, how many)."""
+    typical = segs[-1][2] or 12.0
+    need = int(-(-max(since, 0.0) // typical)) + 1
+    if need <= len(segs):
+        return list(segs[-need:])
+    older = walk_back(segs[0][0], min(90, need - len(segs))) if pattern else []
+    return [(q, seq_uri(pattern, q), typical) for q in older] + list(segs)
 
 
 class SegmentGone(Exception):
@@ -411,6 +666,7 @@ class HlsRecorder:
         self.missed_at_start = 0.0
         self.host = self.host_at_start = ""
         self.media = None
+        self.renew = False
         self.out = None
         self.pending = None
         self.part_secs = 0.0
@@ -452,6 +708,8 @@ class HlsRecorder:
 
     def _failed(self, err):
         j = self.job
+        if self.stop_ev.is_set():                            # paused or stopped: a newer recorder may own the job now
+            return
         self.fails += 1
         if self.incident_t is None:
             self.incident_t, self.missed_at_start, self.host_at_start = time.time(), self.missed_secs, self.host
@@ -459,7 +717,7 @@ class HlsRecorder:
         j.errors.append(msg[:160])
         self.log(msg + f" (failure {self.fails})", logging.WARNING)
         if self.fails % 3 == 0:                              # keep failing: fetch a fresh token and try the other server
-            self.media = None
+            self.renew = True                                # main() swaps the playlist; the workers keep their copy
             j.alt = not j.alt
         if not self.notified and time.time() - self.incident_t >= 5:
             self.notified, self.retrying = True, True
@@ -476,15 +734,15 @@ class HlsRecorder:
 
     def _recovered(self):
         j = self.job
-        if self.incident_t is None:
+        if self.incident_t is None or self.stop_ev.is_set():
             return
         stall = time.time() - self.incident_t
         if self.notified:
             missed = self.missed_secs - self.missed_at_start
             switched = bool(self.host_at_start) and self.host != self.host_at_start
-            j.drops.append({"gap": stall, "missed": missed, "backup": switched})
-            j.incidents.append({"start": self.incident_t, "end": time.time(), "stall": stall, "missed": missed,
-                                "errors": list(j.errors), "switched": switched})
+            j.add_drop(stall, switched, missed)
+            j.add_incident({"start": self.incident_t, "end": time.time(), "stall": stall, "missed": missed,
+                            "errors": list(j.errors), "switched": switched})
             self.log(f"recovered after {stall:.0f} s; " + (f"missed about {missed:.0f} s of video" if missed else "nothing missed"))
             j.app.q.put(lambda: j.app.log(f"{j.label}: recovered after {stall:.0f} s, "
                                           + (f"about {missed:.0f} s of video was missed" if missed else "nothing was missed")))
@@ -511,13 +769,13 @@ class HlsRecorder:
         j.app.q.put(lambda: j.app.log(f"{j.label}: about {p['secs']:.0f} s of video could not be recovered; "
                                       f"continuing in {os.path.basename(self.path)}"))
 
-    def chunk_exists(self, seq):
+    def chunk_exists(self, seq, media):
         """Does a chunk with this number exist on the server? (asks for a single byte)"""
         tried = []
         for _ in range(2):
-            host = self.pick_host(tried)
+            host = self.pick_host(tried, media)
             tried.append(host)
-            url = with_host(urllib.parse.urljoin(self.media, self.pattern.replace("{seq}", str(seq))), host)
+            url = with_host(urllib.parse.urljoin(media, seq_uri(self.pattern, seq)), host)
             try:
                 req = urllib.request.Request(url, headers={**UA, "Range": "bytes=0-0"})
                 with urllib.request.urlopen(req, timeout=6, context=SSL_CTX) as r:
@@ -533,21 +791,21 @@ class HlsRecorder:
                 return False
         return False
 
-    def walk_back(self, oldest, limit=90):
+    def walk_back(self, oldest, media, limit=90):
         """Chunks of the (restarted) stream that are older than the oldest one listed: they exist back to the moment the
         stream restarted and not beyond. Returns their numbers, oldest first."""
         if not self.pattern:
             return []
         found = []
         for q in range(oldest - 1, oldest - 1 - limit, -1):
-            if self.stop_ev.is_set() or not self.chunk_exists(q):
+            if self.stop_ev.is_set() or not self.chunk_exists(q, media):
                 break
             found.append(q)
         return found[::-1]
 
-    def pick_host(self, tried):
+    def pick_host(self, tried, media):
         """Main server first, then others we know of, then ask the site for more."""
-        first = urllib.parse.urlsplit(self.media).netloc
+        first = urllib.parse.urlsplit(media).netloc
         if first not in tried:
             return first
         for _ in range(2):
@@ -560,15 +818,16 @@ class HlsRecorder:
                 break
         return first
 
-    def fetch_segment(self, seq, uri):
-        """One chunk: up to 4 attempts, each on a different server if possible. Raises SegmentGone if it's gone everywhere."""
+    def fetch_segment(self, seq, uri, media):
+        """One chunk: up to 4 attempts, each on a different server if possible. Raises SegmentGone if it's gone everywhere.
+        `media` is the playlist URL when the chunk was queued: main() may swap self.media meanwhile."""
         tried, last, gone = [], None, 0
         for limit in (20, 20, 30, 45):
             if self.stop_ev.is_set():
                 raise StopRequested()
-            host = self.pick_host(tried)
+            host = self.pick_host(tried, media)
             tried.append(host)
-            url = with_host(urllib.parse.urljoin(self.media, uri), host)
+            url = with_host(urllib.parse.urljoin(media, uri), host)
             try:
                 return http_get(url, self.stop_ev, timeout=8, limit=limit)
             except StopRequested:
@@ -599,7 +858,7 @@ class HlsRecorder:
             self.pending = p
             self.missed_secs += secs
 
-    def download(self, todo):
+    def download(self, todo, media):
         """Fetch the chunks in `todo` (seq, uri or None, seconds) in parallel and write them in order."""
         j = self.job
         pending, it = collections.deque(), iter(todo)
@@ -610,7 +869,7 @@ class HlsRecorder:
                 if nxt is None:
                     return
                 q, u, d = nxt
-                pending.append((q, d, self.pool.submit(self.fetch_segment, q, u) if u else None))
+                pending.append((q, d, self.pool.submit(self.fetch_segment, q, u, media) if u else None))
         fill()
         try:
             while pending:
@@ -625,6 +884,8 @@ class HlsRecorder:
                     self.log(f"chunk {q} is gone from every server (older than TVMi keeps them), counted as missed", logging.WARNING)
                     fill()
                     continue
+                if self.stop_ev.is_set():                   # paused or stopped: don't start new parts under a newer recorder
+                    raise StopRequested()
                 if self.pending:
                     self.close_gap()
                 self.out.write(data)
@@ -649,19 +910,21 @@ class HlsRecorder:
             self.out = open(self.path, "ab")
             while not self.stop_ev.is_set():
                 try:
-                    if self.media is None:
+                    if self.media is None or self.renew:
+                        self.renew = False
                         master = self.first_url or stream_url(j.ch, j.alt, timeout=10)
                         self.first_url = None
                         self.host = master.split("/")[2]
                         self.media = best_variant(master, http_get(master, self.stop_ev).decode("utf-8", "replace"))
-                    segs = parse_media_playlist(http_get(self.media, self.stop_ev).decode("utf-8", "replace"))
+                    media = self.media
+                    segs = parse_media_playlist(http_get(media, self.stop_ev).decode("utf-8", "replace"))
                     if not segs:
                         raise RuntimeError("the playlist has no segments")
                     self.newest = segs[-1][0]
                     listed = {x[0]: (x[1], x[2]) for x in segs}
                     typical = segs[-1][2]
-                    if self.pattern is None and str(segs[-1][0]) in segs[-1][1]:
-                        self.pattern = segs[-1][1].replace(str(segs[-1][0]), "{seq}")
+                    if self.pattern is None:
+                        self.pattern = seq_pattern(segs[-1][0], segs[-1][1])
                     if self.last_seq is None:
                         todo = segs[-self.start_back:]
                     elif self.newest - self.last_seq > self.MAX_FORWARD or self.newest - self.last_seq < -self.MAX_BACK:
@@ -670,12 +933,11 @@ class HlsRecorder:
                         # (Without this the recorder asked for thousands of chunks that never existed and called them lost.)
                         typical_s = segs[-1][2]
                         old_seq = self.last_seq
-                        if self.pattern is None and str(segs[-1][0]) in segs[-1][1]:
-                            self.pattern = segs[-1][1].replace(str(segs[-1][0]), "{seq}")
-                        # The new stream holds everything since it restarted (about 18 min), so take ALL of it, not just the
-                        # last few chunks: the restart usually happens the instant the old stream ends, which means nothing is lost.
-                        older = self.walk_back(segs[0][0])
-                        todo = [(q, self.pattern.replace("{seq}", str(q)), typical_s) for q in older] + list(segs)
+                        # Take the new stream back to the last chunk we wrote, judged by the clock, and no further. After a
+                        # restart that is everything since it began. If instead a server simply numbers chunks differently,
+                        # anything older would be video already in the file, appended a second time.
+                        todo = jump_todo(segs, self.pattern, time.time() - self.last_write,
+                                         lambda oldest, n: self.walk_back(oldest, media, n))
                         have = len(todo) * typical_s
                         est = max(0.0, time.time() - have - self.last_write)
                         self.log(f"chunk numbers jumped from {old_seq} to {self.newest} (the stream restarted): taking all "
@@ -690,12 +952,12 @@ class HlsRecorder:
                             if q in listed:
                                 todo.append((q, listed[q][0], listed[q][1]))
                             else:                              # fell out of the playlist: fetch it by number
-                                todo.append((q, self.pattern.replace("{seq}", str(q)) if self.pattern else None, typical))
+                                todo.append((q, seq_uri(self.pattern, q), typical))
                         lag = len(todo) * typical
                         if lag >= 30:
                             self.job.max_lag = max(self.job.max_lag, lag)
                             self.log(f"{len(todo)} chunk(s) behind live (about {lag:.0f} s), catching up")
-                    self.download(todo)
+                    self.download(todo, media)
                     self.recovered()
                     if self.draining and (self.last_seq >= self.drain_target or time.time() > self.drain_deadline):
                         break
@@ -736,6 +998,27 @@ class HlsRecorder:
 
 
 # ------------------------------------------------------------------ one recording
+class DropStats:
+    """A running summary of a recording's drops. A flaky connection can drop thousands of times, so the drops
+    themselves aren't kept."""
+
+    def __init__(self):
+        self.count, self.worst, self.missed, self.backup, self.measured = 0, 0.0, 0.0, False, True
+
+    def add(self, gap, backup, missed=None):
+        self.count += 1
+        self.worst = max(self.worst, gap)
+        self.backup = self.backup or bool(backup)
+        if missed is None:
+            self.measured = False          # ffmpeg engine: how much was lost isn't known
+        else:
+            self.missed += missed
+
+    def summary(self):
+        return {"count": self.count, "worst": self.worst, "missed": self.missed, "backup": self.backup,
+                "measured": self.measured}
+
+
 class Job:
     """One ffmpeg recording of one channel. Reconnects on drops (new part, fresh token),
     can be paused (new part on resume) and stops itself at end_at / after `limit` seconds."""
@@ -753,8 +1036,9 @@ class Job:
         self.retry_at = 0.0
         self.file = ""
         self.files = []
-        self.drops = []                # {"gap": seconds without recording, "backup": used the backup server}
-        self.incidents = []            # every connection problem, for the report file
+        self.drops = DropStats()       # how often the stream dropped, the longest stall, video missed
+        self.incidents = []            # connection problems for the report file (the first MAX_INCIDENTS)
+        self.more_incidents = 0        # ...and how many more there were
         self.gaps = []                 # video that could not be recovered (each one splits the file)
         self.part_stats = {}           # file -> {"secs": video seconds, "bytes": ...} (built-in recorder)
         self.first_start = 0.0
@@ -769,22 +1053,37 @@ class Job:
         self.alerted_at = 0.0
         self.announced = False
         self.problem = ""              # why it stopped early, if it did (shown in Discord)
+        self.problem_kind = ""         # "low disk space" or "stopped early", for the Upcoming list
+        self.size = 0                  # size of the current part, kept up to date off the window's thread
         self.info = {}                 # for followed shows: {"scheduled": "00:01 – 00:31"}
         self.alt = False               # after a drop, try TVMi's second server
         self.errors = collections.deque(maxlen=5)   # ffmpeg's last messages, shown when it drops
         self.done_at = 0.0
-        check_space(outdir)
-        os.makedirs(outdir, exist_ok=True)
+        run_bounded(lambda: (check_space(outdir), os.makedirs(outdir, exist_ok=True)), 8)
         self.begin_part()
 
+    MAX_INCIDENTS = 100
+
+    def add_drop(self, gap, backup, missed=None):
+        self.drops.add(gap, backup, missed)
+
+    def add_incident(self, incident):
+        if len(self.incidents) < self.MAX_INCIDENTS:
+            self.incidents.append(incident)
+        else:
+            self.more_incidents += 1
+
     def next_part_path(self):
-        """Reserve the next part file (used when a gap splits the recording)."""
+        """Reserve the next free part file: '<base>.ts' first, then '<base> part2.ts' and so on. Every new part (resume,
+        reconnect, or a gap in the built-in recorder) comes through here, under one lock."""
         with self.plock:
+            n = 1
             while True:
-                self.part += 1
-                path = os.path.join(self.outdir, f"{self.base} part{self.part}.ts")
-                if not os.path.exists(path):
+                path = os.path.join(self.outdir, f"{self.base}{'' if n == 1 else f' part{n}'}.ts")
+                if path not in self.files and not os.path.exists(path):
                     break
+                n += 1
+            self.part = n
             self.file = path
             self.files.append(path)
         return path
@@ -801,14 +1100,34 @@ class Job:
         self.gen += 1
         gen = self.gen
 
+        use_ffmpeg = self.app.use_ffmpeg()
+
         def work():
+            # Everything that can hang (the network, a disk that stopped answering, running ffmpeg -h) happens here,
+            # not on the window's thread, which also starts and stops recordings on time.
+            try:
+                check_space(self.outdir)
+            except LowSpace as e:
+                self.app.q.put(lambda err=e: self.low_space(gen, err))
+                return
+            except OSError:
+                pass                                  # the folder itself is checked when the file is opened
             try:
                 url = stream_url(self.ch, self.alt)
             except Exception as e:
                 self.app.q.put(lambda err=e: self.fetch_failed(gen, err))
                 return
-            self.app.q.put(lambda: self.launch(gen, url))
+            opts = resilience_opts(self.app.ffmpeg) if use_ffmpeg else []
+            path = self.next_part_path() if gen == self.gen else ""
+            self.app.q.put(lambda: self.launch(gen, url, path, opts))
         threading.Thread(target=work, daemon=True).start()
+
+    def low_space(self, gen, err):
+        if gen != self.gen:
+            return
+        self.app.log(f"{self.label}: stopped. {err}")
+        self.problem, self.problem_kind = str(err), "low disk space"
+        self.stop(user=False)
 
     def fetch_failed(self, gen, err):
         if gen != self.gen:
@@ -817,37 +1136,27 @@ class Job:
         self.state = "reconnecting"
         self.retry_at = time.monotonic() + 5
 
-    def launch(self, gen, url):
-        if gen != self.gen:
+    def launch(self, gen, url, path, opts):
+        if gen != self.gen or not path:
             return
-        try:
-            check_space(self.outdir)
-        except LowSpace as e:
-            self.app.log(f"{self.label}: stopped. {e}")
-            self.problem = str(e)
-            self.stop(user=False)
-            return
-        while True:
-            self.part += 1
-            suffix = "" if self.part == 1 else f" part{self.part}"
-            self.file = os.path.join(self.outdir, f"{self.base}{suffix}.ts")
-            if not os.path.exists(self.file):
-                break
-        self.engine = "ffmpeg" if self.app.use_ffmpeg() else "built-in"
+        self.file = path
+        self.size = 0
+        self.engine = "ffmpeg" if opts else "built-in"
         if self.engine == "built-in":
             self.proc = HlsRecorder(self, self.file, url)
         else:
-            kw = {"creationflags": 0x08000000} if IS_WIN else {}     # no console window on Windows
+            kw = {"creationflags": 0x08000000} if IS_WIN else {"preexec_fn": _child_dies_with_parent()}
             try:
                 self.proc = subprocess.Popen(
-                    [self.app.ffmpeg, "-loglevel", "warning", "-y", *resilience_opts(self.app.ffmpeg), "-i", url,
+                    [self.app.ffmpeg, "-loglevel", "warning", "-y", *opts, "-i", url,
                      "-c", "copy", "-f", "mpegts", self.file],
                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kw)
             except OSError as e:
                 self.app.log(f"{self.label}: can't start ffmpeg ({e})")
-                self.problem = f"Couldn't start ffmpeg: {e}"
+                self.problem, self.problem_kind = f"Couldn't start ffmpeg: {e}", "stopped early"
                 self.stop(user=False)
                 return
+            tie_to_app(self.proc)
         host = url.split("/")[2]
         switched = bool(getattr(self, "last_host", "")) and host != self.last_host
         self.last_host = host
@@ -859,36 +1168,45 @@ class Job:
              f"{self.end_at.isoformat(timespec='minutes') if self.end_at else (str(self.limit) + ' s' if self.limit else 'stopped by hand')}")
         if self.engine == "ffmpeg":
             threading.Thread(target=self.read_errors, args=(self.proc,), daemon=True).start()
-        self.files.append(self.file)
         self.app.log(f"Recording {self.label} → {os.path.basename(self.file)}")
         self.seg = time.monotonic()
         self.state = "recording"
         if not self.first_start:
             self.first_start = time.time()
         if self.drop_t:
-            self.drops.append({"gap": time.time() - self.drop_t, "backup": switched})
-            self.incidents.append({"start": self.drop_t, "end": time.time(), "stall": time.time() - self.drop_t, "missed": None,
-                                   "errors": list(self.drop_errors), "switched": switched})
+            self.add_drop(time.time() - self.drop_t, switched)
+            self.add_incident({"start": self.drop_t, "end": time.time(), "stall": time.time() - self.drop_t, "missed": None,
+                               "errors": list(self.drop_errors), "switched": switched})
             self.drop_t = 0.0
         if not self.announced:
             self.announced = True
             if not self.test:
                 self.app.notify_started(self)
 
-    def diagnose_drop(self):
-        """Write the facts about an unexpected ffmpeg exit to the log, then probe the network in the background."""
+    def diagnose_drop(self, file, errors):
+        """Runs in the background after an unexpected ffmpeg exit: tidy away a part that never got going, write the
+        facts to the log, then probe the network."""
+        try:                                       # a part that never got going is just clutter
+            if not os.path.exists(file) or os.path.getsize(file) < 20000:
+                if os.path.exists(file):
+                    os.remove(file)
+                with self.plock:
+                    if file in self.files:
+                        self.files.remove(file)
+        except OSError:
+            pass
         try:
             rc = self.last_proc.returncode if getattr(self, "last_proc", None) else "?"
-            size = os.path.getsize(self.file)
-            idle = time.time() - os.path.getmtime(self.file)
+            size = os.path.getsize(file)
+            idle = time.time() - os.path.getmtime(file)
             free = shutil.disk_usage(self.outdir).free / 1024 ** 3
             dlog(f"[{self.label}] DROP: the recorder ({getattr(self, 'engine', '?')}) exited with code {rc} after {time.time() - self.started_at:.0f} s; "
-                 f"file {os.path.basename(self.file)} is {size / 1e6:.1f} MB and was last written {idle:.0f} s ago; "
-                 f"{free:.1f} GB free; last ffmpeg messages: {list(self.errors) or 'none'}"
-                 + (f"; meaning: {explain_error(self.errors)}" if explain_error(self.errors) else ""), logging.WARNING)
+                 f"file {os.path.basename(file)} is {size / 1e6:.1f} MB and was last written {idle:.0f} s ago; "
+                 f"{free:.1f} GB free; last ffmpeg messages: {errors or 'none'}"
+                 + (f"; meaning: {explain_error(errors)}" if explain_error(errors) else ""), logging.WARNING)
         except Exception as e:
             dlog(f"[{self.label}] DROP (couldn't gather details: {e})", logging.WARNING)
-        threading.Thread(target=self.probe_network, daemon=True).start()
+        self.probe_network()
 
     def probe_network(self):
         t0 = time.time()
@@ -929,7 +1247,7 @@ class Job:
             if after:
                 t = threading.Thread(target=after)
                 t.start()
-                self.app.reapers.append(t)
+                self.app.add_reaper(t)
             return
         try:
             if isinstance(p, HlsRecorder):
@@ -952,7 +1270,7 @@ class Job:
                 after()
         t = threading.Thread(target=reap)
         t.start()
-        self.app.reapers.append(t)
+        self.app.add_reaper(t)
 
     def pause_resume(self):
         if self.state == "recording":
@@ -985,17 +1303,8 @@ class Job:
         if self.state == "recording" and self.proc and self.proc.poll() is not None:
             self.elapsed = self.rec_time()
             self.proc = None
-            try:                                   # a part that never got going is just clutter
-                if not os.path.exists(self.file) or os.path.getsize(self.file) < 20000:
-                    if os.path.exists(self.file):
-                        os.remove(self.file)
-                    if self.file in self.files:
-                        self.files.remove(self.file)
-                    self.part -= 1
-            except OSError:
-                pass
             self.drop_errors = list(self.errors)
-            self.diagnose_drop()
+            threading.Thread(target=self.diagnose_drop, args=(self.file, list(self.errors)), daemon=True).start()
             why = f" ({' | '.join(list(self.errors)[-2:])})" if self.errors else ""
             self.alt = not self.alt
             meaning = explain_error(self.errors)
@@ -1116,6 +1425,7 @@ class Notifier:
         self.cfg = {"url": "", "kinds": frozenset()}
         self.q = queue.Queue()
         self.worker = None
+        self.lock = threading.Lock()
 
     def configure(self, url, kinds):
         self.cfg = {"url": (url or "").strip(), "kinds": frozenset(kinds)}
@@ -1125,9 +1435,10 @@ class Notifier:
         if kind not in cfg["kinds"] or not DISCORD_URL.match(cfg["url"]):
             return
         self.q.put((cfg["url"], make_embed(title, color, description, fields)))
-        if not self.worker:
-            self.worker = threading.Thread(target=self.run, daemon=True)
-            self.worker.start()
+        with self.lock:                          # one worker, so messages arrive in order
+            if not self.worker:
+                self.worker = threading.Thread(target=self.run, daemon=True)
+                self.worker.start()
 
     def run(self):
         while True:
@@ -1226,10 +1537,15 @@ def my_addresses():
 
 
 def call_ui(app, fn, timeout=10):
-    """Run fn on the window's thread (Tk must only be touched there) and wait for the answer."""
-    box, done = {}, threading.Event()
+    """Run fn on the window's thread (Tk must only be touched there) and wait for the answer. If it hasn't started
+    within `timeout`, it never will: the 503 means nothing happened, so pressing Record again can't record twice."""
+    box, done, lock, flags = {}, threading.Event(), threading.Lock(), {"started": False, "cancelled": False}
 
     def run():
+        with lock:
+            if flags["cancelled"]:
+                return
+            flags["started"] = True
         try:
             box["ok"] = fn()
         except WebError as e:
@@ -1242,7 +1558,13 @@ def call_ui(app, fn, timeout=10):
         done.set()
     app.q.put(run)
     if not done.wait(timeout):
-        return 503, {"error": "The recorder didn't answer in time (is a dialog open on the PC?)"}
+        with lock:
+            if not flags["started"]:
+                flags["cancelled"] = True
+                return 503, {"error": "The recorder is busy and didn't take the request (is a dialog open on the PC?). "
+                                      "Nothing was done."}
+        if not done.wait(timeout):                       # it started just in time: let it finish
+            return 503, {"error": "The recorder is taking a long time over this. It may still happen."}
     if "err" in box:
         return box["err"][0], {"error": box["err"][1]}
     return 200, box["ok"]
@@ -1258,14 +1580,49 @@ class QuietServer(ThreadingHTTPServer):
             dlog(f"web: error handling a request from {client_address[0]}:\n{traceback.format_exc()}", logging.WARNING)
 
 
+def new_password():
+    """A password that is easy to type on a phone: 12 letters and digits, no look-alikes."""
+    return "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
+
+
+class LoginLimiter:
+    """Slows down password guessing: after 5 wrong passwords from one address, that address must wait (30 s, then
+    doubling up to an hour) before trying again. A right password clears it."""
+    FREE, FIRST, MAX = 5, 30.0, 3600.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.lock, self.state = clock, threading.Lock(), {}
+
+    def wait_left(self, ip):
+        with self.lock:
+            st = self.state.get(ip)
+            return max(0.0, st["until"] - self.clock()) if st else 0.0
+
+    def failed(self, ip):
+        with self.lock:
+            st = self.state.setdefault(ip, {"n": 0, "until": 0.0})
+            st["n"] += 1
+            if st["n"] >= self.FREE:
+                st["until"] = self.clock() + min(self.MAX, self.FIRST * 2 ** (st["n"] - self.FREE))
+            if len(self.state) > 1000:                 # don't grow without limit
+                self.state.pop(next(iter(self.state)))
+
+    def succeeded(self, ip):
+        with self.lock:
+            self.state.pop(ip, None)
+
+
 class WebServer:
     def __init__(self, app):
         self.app, self.httpd = app, None
+        self.limiter = LoginLimiter()
 
-    def start(self, port, lan, password):
+    def start(self, port, lan, password, host=None):
         """Returns "" on success, or a message saying why it couldn't start."""
         self.stop()
-        app = self.app
+        app, limiter = self.app, self.limiter
+        if lan and not password:
+            return "The web page needs a password before other devices can connect."
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "TVMiRecorder"
@@ -1300,15 +1657,22 @@ class WebServer:
                     self.send(403, {"error": "Unexpected host name. Use the IP address shown in the app."})
                     return False
                 if password and self.path.split("?")[0] not in ICON_PATHS:      # icons aren't secret; browsers fetch them without a login
+                    wait = limiter.wait_left(ip)
+                    if wait:
+                        self.send(429, {"error": f"Too many wrong passwords. Try again in {wait:.0f} s."},
+                                  extra=[("Retry-After", str(int(wait) + 1))])
+                        return False
                     try:
                         given = base64.b64decode(self.headers.get("Authorization", "")[6:]).decode("utf-8").split(":", 1)[1]
                     except Exception:
                         given = None
                     if given is None or not hmac.compare_digest(given.encode(), password.encode()):
                         if given is not None:
+                            limiter.failed(ip)
                             dlog(f"web: wrong password from {ip}", logging.WARNING)
                         self.send(401, {"error": "Password needed."}, extra=[("WWW-Authenticate", 'Basic realm="TVMi Recorder"')])
                         return False
+                    limiter.succeeded(ip)
                 return True
 
             def do_GET(self):
@@ -1344,6 +1708,8 @@ class WebServer:
                     return self.send(415, {"error": "JSON only"})
                 try:
                     n = int(self.headers.get("Content-Length", "0"))
+                    if n < 0:
+                        raise ValueError
                     if n > 2_000_000:
                         return self.send(413, {"error": "Too large"})
                     body = json.loads(self.rfile.read(n) or b"{}")
@@ -1357,7 +1723,7 @@ class WebServer:
                 self.send(code, res)
 
         try:
-            self.httpd = QuietServer(("0.0.0.0" if lan else "127.0.0.1", port), Handler)
+            self.httpd = QuietServer((host or ("0.0.0.0" if lan else "127.0.0.1"), port), Handler)
         except OSError as e:
             self.httpd = None
             return f"Couldn't start the web page on port {port}: {e}"
@@ -1488,7 +1854,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  </div>
  <div class="card"><h2>Record now</h2>
   <div class="row">
-   <div><label for="ch">Channel</label><select id="ch"><option value="2">TVM</option><option value="3">TVM+</option><option value="4">TVMsport+</option></select></div>
+   <div><label for="ch">Channel</label><select id="ch"><option value="2">TVM</option><option value="3">TVM+</option><option value="4">TVMsport+</option><option value="5">Magic</option><option value="6">Radju Malta</option><option value="7">Radju Malta 2</option></select></div>
    <div><label for="h">Stop after (hours)</label><input id="h" type="number" min="0" max="99" value="0"></div>
    <div><label for="m">minutes</label><input id="m" type="number" min="0" max="59" value="0"></div>
   </div>
@@ -1609,12 +1975,18 @@ poll();setInterval(poll,2000);setInterval(loadLog,3000);
 
 # ------------------------------------------------------------------ the app
 DEFAULTS = {"engine": "hls", "out": os.path.join(HOME, "Videos"), "pre": 3, "post": 10, "auto": True,
-            "login": False, "mkv": False, "del_ts": True, "web": True, "web_lan": True, "web_port": 9001, "web_pw": "", "dc_url": "",
+            "login": False, "mkv": False, "del_ts": True, "web": True, "web_lan": False, "web_port": 9001, "web_pw": "", "dc_url": "",
             **{"dc_" + k: True for k, _ in DC_KINDS},
             "channel": 2, "h": 0, "m": 0, "name": "",
             "all": False, "all_per_day": "first", "all_skip_news": True}
 NEWS_RE = re.compile(r"a[ħh]bar|news", re.I)       # bulletins: "Record ALL shows" leaves these out unless told not to
 PER_DAY = {"first": "First airing each day", "all": "Every airing"}
+SKIP_LABEL = {"low disk space": "skipped (low disk)", "error": "skipped (error)", "stopped early": "stopped early"}
+
+
+def sched_key(it):
+    """How a listing is known in the history: channel, start time and show."""
+    return f'{it["ch"]}|{it["start"].isoformat()}|{norm(it["title"])}'
 CH_FILTER = {0: "Any channel", **{n: f"{name} only" for n, name in CHANNELS.items()}}
 
 
@@ -1630,8 +2002,13 @@ class App:
         self.data = load_json(SETTINGS_FILE, {})
         s = dict(DEFAULTS)
         s.update(self.data.get("s", {}))
-        self.follows = self.data.get("follows", [])
+        self.follows = clean_follows(self.data.get("follows", []))
         self.hist = self.data.get("hist", {})
+        self.closing = False
+        self.fast_quit = False         # quitting for the OS (logout, shutdown): no .mkv conversion, don't wait long
+        self.term = False              # set by SIGTERM / SIGHUP
+        self.converting = set()        # ffmpeg conversions running now, so "Quit now" can stop them
+        self.save_job = None
         cache = load_json(SCHEDULE_FILE, {})
         fresh = cache.get("v") == SCHEDULE_VERSION       # older caches have the old end-time logic
         self.sched = self.parse_sched(cache.get("items", [])) if fresh else []
@@ -1672,6 +2049,8 @@ class App:
         self.v_fch = tk.StringVar()
         self.v_fday = tk.StringVar()
         self.v_filter.trace_add("write", lambda *_: self.fill_shows())
+        for v in (self.v_pre, self.v_post, self.v_out):      # typed values, not only arrow clicks and Browse
+            v.trace_add("write", lambda *_: self.save_soon())
 
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
@@ -1681,6 +2060,15 @@ class App:
         self.build_settings(nb)
         self.build_bottom(root)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        # Logging out or shutting down: Windows sends this (Tk turns WM_QUERYENDSESSION into it), Linux sends SIGTERM.
+        # Don't ask "Stop them and quit?" then: the OS will close the app anyway.
+        root.protocol("WM_SAVE_YOURSELF", lambda: self.close(confirm=False, fast=True))
+        for name in ("SIGTERM", "SIGHUP"):
+            if hasattr(signal, name):
+                try:
+                    signal.signal(getattr(signal, name), lambda *_: setattr(self, "term", True))
+                except (ValueError, OSError):
+                    pass
 
         if not self.ffmpeg and self.v_ffmpeg_engine.get():
             messagebox.showwarning("TVMi Recorder", "ffmpeg wasn't found.\n\nInstall it (Windows: winget install ffmpeg; "
@@ -1691,7 +2079,9 @@ class App:
         self.fill_follows()
         root.report_callback_exception = self.report_callback_exception
         self.web = WebServer(self)
-        self.log_startup()
+        self.raise_seen = self.raise_stamp()
+        threading.Thread(target=self.log_startup, args=(self.startup_facts(),), daemon=True).start()
+        threading.Thread(target=self.watch_sizes, daemon=True).start()
         self.start_web()
         self.pump()
         self.notifier.send("app", "🟢 TVMi Recorder started", GREEN,
@@ -1701,7 +2091,13 @@ class App:
         self.log("Ready. Keep this window open (minimised is fine): recordings only happen while it's running.")
         self.tick()
 
-    def log_startup(self):
+    def startup_facts(self):
+        return {"engine": self.v_ffmpeg_engine.get(), "out": self.v_out.get(), "pre": self.v_pre.get(),
+                "post": self.v_post.get(), "auto": self.v_auto.get(), "mkv": self.v_mkv.get(),
+                "follows": [f["title"] for f in self.follows]}
+
+    def log_startup(self, facts):
+        """Runs in the background: running ffmpeg can take a while."""
         ver = ""
         if self.ffmpeg:
             try:
@@ -1713,12 +2109,12 @@ class App:
         dlog("=" * 70)
         dlog(f"Started. Python {sys.version.split()[0]} on {sys.platform}; tk {tk.TkVersion}; time zone data: {'yes' if TZ else 'NO'}; "
              f"certifi: {'yes' if 'certifi' in sys.modules or _has_certifi() else 'no'}")
-        dlog(f"recording method: {'ffmpeg' if self.v_ffmpeg_engine.get() else 'built-in recorder'}")
+        dlog(f"recording method: {'ffmpeg' if facts['engine'] else 'built-in recorder'}")
         dlog(f"ffmpeg: {self.ffmpeg} | {ver}" + ("" if self.ffmpeg else " (not found: needed only for .mkv conversion and the Test file check)"))
         if self.ffmpeg:
             dlog(f"ffmpeg resilience options: {' '.join(resilience_opts(self.ffmpeg))}")
-        dlog(f"save folder: {self.v_out.get()} | margins: {self.v_pre.get()} min early, {self.v_post.get()} min late | "
-             f"auto: {self.v_auto.get()} | mkv: {self.v_mkv.get()} | follows: {[f['title'] for f in self.follows]}")
+        dlog(f"save folder: {facts['out']} | margins: {facts['pre']} min early, {facts['post']} min late | "
+             f"auto: {facts['auto']} | mkv: {facts['mkv']} | follows: {facts['follows']}")
         dlog(f"config folder: {CFG}")
 
     # ---------- persistence
@@ -1765,10 +2161,56 @@ class App:
         except OSError:
             pass
 
+    LOG_ROWS = 1000
+
     def log(self, msg):
         dlog(msg)
         self.logbox.insert("end", f"{now():%H:%M:%S}  {msg}")
+        extra = self.logbox.size() - self.LOG_ROWS          # the app runs for weeks: keep only the latest rows
+        if extra > 0:
+            self.logbox.delete(0, extra - 1)
         self.logbox.see("end")
+
+    def save_soon(self):
+        """Save a moment after the last keystroke, so a typed value isn't lost if the app doesn't exit cleanly."""
+        if self.save_job:
+            self.root.after_cancel(self.save_job)
+        self.save_job = self.root.after(800, self.saved_soon)
+
+    def saved_soon(self):
+        self.save_job = None
+        self.save()
+
+    def add_reaper(self, t):
+        self.reapers = [r for r in self.reapers if r.is_alive()] + [t]
+
+    def watch_sizes(self):
+        """Background thread: keep each recording's file size up to date. A hung network drive can block this for
+        minutes; on the window's thread that would stop recordings from ending on time."""
+        while True:
+            for j in list(self.jobs):
+                if j.state != "done" and j.file:
+                    try:
+                        j.size = os.path.getsize(j.file)
+                    except OSError:
+                        pass
+            time.sleep(3)
+
+    @staticmethod
+    def raise_stamp():
+        try:
+            return os.path.getmtime(RAISE_FILE)
+        except OSError:
+            return 0.0
+
+    def check_raise(self):
+        """Another copy was started and asked this one to show its window."""
+        stamp = self.raise_stamp()
+        if stamp != self.raise_seen:
+            self.raise_seen = stamp
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
 
     def report_callback_exception(self, exc, val, tb):
         dlog("Uncaught exception in the window:\n" + "".join(traceback.format_exception(exc, val, tb)), logging.ERROR)
@@ -1941,16 +2383,21 @@ class App:
                         ).grid(row=0, column=1, columnspan=4, sticky="w", padx=12)
         ttk.Label(wf, text="Port").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Spinbox(wf, from_=1024, to=65535, width=7, textvariable=self.v_webport).grid(row=1, column=1, sticky="w", padx=12)
-        ttk.Label(wf, text="Password (optional)").grid(row=1, column=2, sticky="e")
-        ttk.Entry(wf, textvariable=self.v_webpw, show="•", width=18).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Button(wf, text="Apply", command=self.apply_web).grid(row=1, column=4, padx=6)
+        ttk.Label(wf, text="Password").grid(row=1, column=2, sticky="e")
+        pw = ttk.Entry(wf, textvariable=self.v_webpw, show="•", width=18)
+        pw.grid(row=1, column=3, sticky="w", padx=6)
+        self.v_webpw_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wf, text="show", variable=self.v_webpw_show,
+                        command=lambda: pw.config(show="" if self.v_webpw_show.get() else "•")).grid(row=1, column=4)
+        ttk.Button(wf, text="Apply", command=self.apply_web).grid(row=1, column=5, padx=6)
         self.web_text = tk.Text(wf, height=3, width=72, borderwidth=0, wrap="none", background=self.root.cget("background"))
-        self.web_text.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        self.web_text.grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
         self.web_text.config(state="disabled")
         ttk.Label(wf, foreground="gray40", wraplength=620, justify="left",
-                  text="Only this computer, your local network and Tailscale can connect, never the wider internet. "
-                       "Without a password, anyone on those networks can control your recorder."
-                  ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
+                  text="Off by default: only this computer can open the page. Let other devices connect and they need "
+                       "the password (one is made for you if it's blank). Your local network and Tailscale can connect, "
+                       "never the wider internet. 5 wrong passwords lock that device out for a while."
+                  ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
         df = ttk.LabelFrame(f, text="Discord notifications", padding=8)
         df.grid(row=8, column=0, columnspan=3, sticky="we", pady=(12, 0))
         ttk.Label(df, text="Webhook URL").grid(row=0, column=0, sticky="w")
@@ -2013,11 +2460,11 @@ class App:
 
         def work():
             try:
-                items = fetch_schedule()
+                items, failed = fetch_schedule()
             except Exception as e:
                 self.q.put(lambda err=e: self.schedule_failed(err))
                 return
-            self.q.put(lambda: self.schedule_loaded(items))
+            self.q.put(lambda: self.schedule_loaded(items, failed))
         threading.Thread(target=work, daemon=True).start()
 
     def schedule_failed(self, err):
@@ -2030,10 +2477,16 @@ class App:
             self.notifier.send("sched", "⚠️ Schedule isn't updating", AMBER,
                                f"Couldn't reach tvmi.mt for {hours:.0f} hours ({err}). Followed shows may be missed.")
 
-    def schedule_loaded(self, items):
+    def schedule_loaded(self, items, failed=()):
         self.fetching = False
         if not items:
             return self.schedule_failed("no programmes found")
+        if failed:
+            old = [{"ch": x["ch"], "title": x["title"], "start": x["start"].isoformat(), "end": x["end"].isoformat(),
+                    "guess": x["guess"]} for x in self.sched]
+            items = merge_schedule(items, old, set(failed))
+            pages = ", ".join(f"{CHANNELS.get(c, c)} {d}" for c, d in sorted(failed))
+            self.log(f"Some schedule pages didn't load ({pages}); kept the previous listings for those")
         self.sched = self.parse_sched(items)
         self.sched_alerted = False
         self.sched_time = time.time()
@@ -2107,6 +2560,37 @@ class App:
         self.ftree.selection_set(keep)
 
     # ---------- planner
+    def reconcile_jobs(self):
+        """TVMi often moves times during the day. A recording that has started keeps its listing even if the new schedule
+        moved it: it is matched to the moved listing (same channel and show, overlapping times), and its end moves later
+        if the show now ends later. Without this the end was cut off, or "Every airing" recorded the show twice."""
+        post = dt.timedelta(minutes=self.num(self.v_post, 10, 0, 120))
+        keys = {sched_key(it) for it in self.sched}
+        for j in self.jobs:
+            if j.state == "done" or not j.key or j.key in keys or not j.end_at:
+                continue
+            try:
+                ch, start_iso, tn = j.key.split("|", 2)
+                ch, old_start = int(ch), dt.datetime.fromisoformat(start_iso)
+            except ValueError:
+                continue
+            cands = [it for it in self.sched if it["ch"] == ch and norm(it["title"]) == tn
+                     and sched_key(it) not in self.hist and it["start"] < j.end_at and it["end"] > old_start]
+            if not cands:
+                continue
+            it = min(cands, key=lambda x: abs((x["start"] - old_start).total_seconds()))
+            new = sched_key(it)
+            if j.key in self.hist:
+                self.hist[new] = self.hist.pop(j.key)
+                self.hist[new]["date"] = it["start"].date().isoformat()
+            j.key = new
+            j.info = {"scheduled": f"{it['start']:%H:%M} – {it['end']:%H:%M}" + (" (length guessed)" if it.get("guess") else "")}
+            if it["end"] + post > j.end_at:              # never earlier: a few spare minutes are cheaper than a cut-off ending
+                j.end_at = it["end"] + post
+            self.log(f"{j.label}: the schedule moved it to {it['start']:%H:%M} – {it['end']:%H:%M}; "
+                     f"recording until {j.end_at:%H:%M}")
+            self.save()
+
     def plan(self, nowdt):
         """Rows for followed shows: (item, key, status, follow), plus the pre/post margins."""
         pre = dt.timedelta(minutes=self.num(self.v_pre, 3, 0, 60))
@@ -2114,7 +2598,7 @@ class App:
         fl = {norm(f["title"]): f for f in self.follows}
         all_on, all_day, skip_news = self.v_all.get(), self.day_key(self.v_all_day.get()), self.v_all_news.get()
         active = {j.key for j in self.jobs if j.state != "done" and j.key}
-        chosen = {(h["title_n"], h["date"]) for h in self.hist.values()}
+        chosen = {(h["title_n"], h["date"]) for h in self.hist.values() if not h.get("skip")}   # a failed airing doesn't block the repeat
         rows = []
         for it in self.sched:
             f = fl.get(norm(it["title"]))                    # a show you follow keeps its own settings
@@ -2125,11 +2609,12 @@ class App:
             if it["end"] + post < nowdt - dt.timedelta(hours=2):
                 continue
             tn, date = norm(it["title"]), it["start"].date().isoformat()
-            key = f'{it["ch"]}|{it["start"].isoformat()}|{tn}'
+            key = sched_key(it)
             h = self.hist.get(key)
             over = it["end"] + post <= nowdt
             if h:
-                status = ("skipped (" + ("low disk" if h["skip"] == "low disk space" else "error") + ")" if h.get("skip") else "recorded") if h["done"] else ("recording" if key in active else ("interrupted" if over else "resume"))
+                status = (SKIP_LABEL.get(h["skip"], "skipped (error)") if h.get("skip") else "recorded") if h["done"] \
+                    else ("recording" if key in active else ("interrupted" if over else "resume"))
             elif f["per_day"] == "first" and (tn, date) in chosen:
                 status = "repeat (skipped)"
             elif over:
@@ -2144,9 +2629,13 @@ class App:
         return rows, pre, post
 
     def run_planner(self, nowdt):
+        self.reconcile_jobs()
         rows, pre, post = self.plan(nowdt)
         auto_on, can, started = self.v_auto.get(), self.can_record(), 0
-        self.utree.delete(*self.utree.get_children())
+        keep = {key for _, key, _, _ in rows}
+        stale = [iid for iid in self.utree.get_children() if iid not in keep]
+        if stale:
+            self.utree.delete(*stale)
         for n, (it, key, status, f) in enumerate(rows):
             w0, w1 = it["start"] - pre, it["end"] + post
             label = {"start": "starting…", "resume": "resuming…"}.get(status, status)
@@ -2154,9 +2643,13 @@ class App:
                 label = "NOT recording: automatic recording is off"
             elif not can and status in ("start", "resume", "waiting"):
                 label = "NOT recording: ffmpeg is missing"
-            self.utree.insert("", "end", iid=str(n), text=it["title"],
-                              values=(f"{w0:%a %d %b %H:%M} – {w1:%H:%M}" + (" (length guessed)" if it.get("guess") else ""),
-                                      CHANNELS[it["ch"]], label))
+            vals = (f"{w0:%a %d %b %H:%M} – {w1:%H:%M}" + (" (length guessed)" if it.get("guess") else ""),
+                    CHANNELS[it["ch"]], label)
+            if self.utree.exists(key):                   # update in place, so the list doesn't jump while you read it
+                self.utree.item(key, text=it["title"], values=vals)
+                self.utree.move(key, "", n)
+            else:
+                self.utree.insert("", n, iid=key, text=it["title"], values=vals)
             if status in ("start", "resume") and auto_on and can:
                 try:
                     self.start_auto(it, key, post)
@@ -2189,7 +2682,8 @@ class App:
             self.log(f"{title}: NOT recorded. {e}")
             self.notify_problem(it, str(e))
         except OSError as e:
-            self.hist[key]["done"] = True
+            self.hist[key].update(done=True, skip="error")
+            self.save()
             self.log(f"{title}: can't use folder {outdir} ({e})")
             self.notify_problem(it, f"Can't use the folder {outdir}: {e}")
 
@@ -2197,12 +2691,12 @@ class App:
         """What to do once ffmpeg has exited for good: convert to .mkv (if wanted), then tell Discord.
         Returns a function to run in the background, or None for test recordings."""
         if job.test:
-            return None
-        convert = self.v_mkv.get() and bool(self.ffmpeg)
-        delete, ffmpeg = self.v_del.get(), self.ffmpeg
+            return lambda: self.check_test(job)        # once the last chunks are in, so the length is right
+        convert = self.v_mkv.get() and bool(self.ffmpeg) and not self.fast_quit
+        delete, ffmpeg, ffprobe = self.v_del.get(), self.ffmpeg, find_ffprobe(self.ffmpeg)
         label = job.label
         facts = {"label": label, "channel": CHANNELS.get(job.ch, str(job.ch)), "recorded": job.elapsed,
-                 "drops": list(job.drops), "outdir": job.outdir, "problem": job.problem,
+                 "drops": job.drops.summary(), "outdir": job.outdir, "problem": job.problem,
                  "errors": list(job.errors), "info": dict(job.info), "user": user, "mkv": convert,
                  "base": job.base, "engine": job.engine, "first_start": job.first_start, "end_wall": job.end_wall}
         facts_lag = lambda: job.max_lag
@@ -2225,10 +2719,17 @@ class App:
                         while os.path.exists(out):
                             out, n = f"{stem} ({n}).mkv", n + 1
                         tmp = out + ".partial"
-                        r = subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-i", f, "-map", "0:v?", "-map", "0:a?",
-                                            "-c", "copy", "-f", "matroska", tmp],
-                                           stdin=subprocess.DEVNULL, capture_output=True, **kw)
-                        if r.returncode == 0 and os.path.getsize(tmp) >= 0.9 * os.path.getsize(f):
+                        if self.fast_quit:
+                            break
+                        p = subprocess.Popen([ffmpeg, "-loglevel", "error", "-y", "-i", f, "-map", "0:v?", "-map", "0:a?",
+                                              "-c", "copy", "-f", "matroska", tmp],
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+                        self.converting.add(p)
+                        try:
+                            p.wait()
+                        finally:
+                            self.converting.discard(p)
+                        if p.returncode == 0 and conversion_ok(ffprobe, f, tmp):
                             os.replace(tmp, out)
                             made[f] = out
                             if delete:
@@ -2251,6 +2752,7 @@ class App:
             facts["converted"] = "failed" if failed else ("yes" if made else "no")
             # the recorder thread has finished by now, so its gap / incident lists are complete
             facts["incidents"], facts["gaps"], facts["part_stats"] = list(job.incidents), list(job.gaps), dict(job.part_stats)
+            facts["more_incidents"] = job.more_incidents
             facts["files"] = files
             facts["max_lag"] = facts_lag()
             facts["report"] = self.write_report(facts, made)
@@ -2320,6 +2822,8 @@ class App:
                     L.append(f"     Meaning: {meaning}.")
             if i["switched"]:
                 L.append("     It carried on using a different TVMi server.")
+        if f.get("more_incidents"):
+            L.append(f"  ...and {f['more_incidents']} more, not listed.")
         base = os.path.join(f["outdir"], f"{f['base']} - report")
         path, k = base + ".txt", 2
         while os.path.exists(path):
@@ -2349,20 +2853,20 @@ class App:
         if count == 0 or size < 200_000:
             why = f["problem"] or "No video was received."
             if f["errors"]:
-                why += "\nLast ffmpeg message: " + f["errors"][-1]
+                why += ("\nLast ffmpeg message: " if f["engine"] == "ffmpeg" else "\nLast error: ") + f["errors"][-1]
             self.notifier.send("fail", "❌ Not recorded", RED, f"{show}\n\n{why}")
             return
         lines = [show, ""]
         drops = f["drops"]
-        if drops:
-            worst = max(d["gap"] for d in drops)
-            backup = ", once on a different server" if any(d["backup"] for d in drops) else ""
-            if all("missed" in d for d in drops):
-                lost = sum(d["missed"] for d in drops)
+        if drops["count"]:
+            worst = drops["worst"]
+            backup = ", once on a different server" if drops["backup"] else ""
+            if drops["measured"]:
+                lost = drops["missed"]
                 result = "nothing missed" if lost < 1 else f"about {fmt_len(lost)} of video missed"
-                lines.append(f"Drops: {len(drops)} (longest stall {worst:.0f} s, {result}{backup})")
+                lines.append(f"Drops: {drops['count']} (longest stall {worst:.0f} s, {result}{backup})")
             else:
-                lines.append(f"Drops: {len(drops)} (longest gap {worst:.0f} s{backup})")
+                lines.append(f"Drops: {drops['count']} (longest gap {worst:.0f} s{backup})")
         else:
             lines.append("Drops: none")
         gaps = f.get("gaps", [])
@@ -2442,9 +2946,11 @@ class App:
     def job_finished(self, job, user):
         if job.key and job.key in self.hist and user != "quit":     # quitting mid-show: resume next launch
             self.hist[job.key]["done"] = True
+            if job.problem:                                         # low disk, ffmpeg wouldn't start: not "recorded"
+                self.hist[job.key]["skip"] = job.problem_kind or "stopped early"
             self.save()
         if job.test:
-            return self.check_test(job)
+            return
         where = f"; saved in {job.outdir}" if job.part else ""
         self.log(f"{job.label}: {'finished' if user is False else 'stopped'}{where}")
 
@@ -2457,6 +2963,8 @@ class App:
 
     def begin_manual(self, ch, limit, name):
         """Start a manual recording. Returns (True, message) or (False, why not). Used by the window and the web page."""
+        if self.closing:
+            return False, "The app is closing."
         if not self.can_record():
             return False, "ffmpeg is not installed."
         if ch not in CHANNELS:
@@ -2475,6 +2983,8 @@ class App:
 
     def begin_test(self, ch):
         """Record 1 minute of a channel into <save folder>/Test, then check the file. Returns (ok, message)."""
+        if self.closing:
+            return False, "The app is closing."
         if not self.can_record():
             return False, "ffmpeg is not installed."
         if ch not in CHANNELS:
@@ -2502,24 +3012,17 @@ class App:
             messagebox.showerror("TVMi Recorder", msg)
 
     def check_test(self, job):
-        """Report whether the test produced a playable file."""
-        def work():
-            msg = "Test FAILED: nothing was recorded. Check your connection, ffmpeg and the channel."
+        """Report whether the test produced a playable file. Runs in the background once the recorder has finished."""
+        msg = "Test FAILED: nothing was recorded. Check your connection, ffmpeg and the channel."
+        try:
             if job.part and os.path.exists(job.file) and os.path.getsize(job.file) > 20000:
                 size = os.path.getsize(job.file) / 1e6
-                probe = shutil.which("ffprobe") or (os.path.join(os.path.dirname(self.ffmpeg), "ffprobe" + (".exe" if IS_WIN else ""))
-                                                    if self.ffmpeg else "ffprobe")
-                length = ""
-                try:
-                    kw = {"creationflags": 0x08000000} if IS_WIN else {}
-                    r = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", job.file],
-                                       capture_output=True, text=True, timeout=30, **kw)
-                    length = f", {float(r.stdout.strip()):.0f} s of video"
-                except Exception:
-                    pass
+                secs = media_duration(find_ffprobe(self.ffmpeg), job.file, timeout=30)
+                length = f", {secs:.0f} s of video" if secs else ""
                 msg = f"Test PASSED: {size:.1f} MB{length} saved as {job.file}"
-            self.q.put(lambda: self.log(msg))
-        threading.Thread(target=work, daemon=True).start()
+        except OSError as e:
+            msg = f"Test FAILED: couldn't check the file ({e})."
+        self.q.put(lambda: self.log(msg))
 
     def selected_job(self):
         """The row you clicked; if none is selected and only one recording is running, that one."""
@@ -2576,9 +3079,7 @@ class App:
             out, changed = resolve_path(str(s["out"]), self.v_out.get())
             pre, post = str(int(s["pre"])), str(int(s["post"]))
             chan, h, m = int(s["channel"]), str(int(s["h"])), str(int(s["m"]))
-            follows = [{"title": str(f["title"]), "channel": f.get("channel", 0) if f.get("channel", 0) in CH_FILTER else 0,
-                        "per_day": f.get("per_day", "first") if f.get("per_day") in PER_DAY else "first"}
-                       for f in d.get("follows", []) if isinstance(f, dict) and f.get("title")]
+            follows = clean_follows(d.get("follows", []), set(CH_FILTER))
         except (ValueError, TypeError, KeyError):
             return False, "The settings in that file are malformed.", ""
         note = ""
@@ -2604,8 +3105,8 @@ class App:
         self.v_all_news.set(bool(s.get("all_skip_news", True)))
         self.follows = follows
         set_autostart(self.v_login.get())
-        self.save()
         self.fill_follows()
+        self.save()
         msg = f"Imported settings and {len(follows)} followed show(s)."
         self.log(msg)
         return True, msg, note
@@ -2637,6 +3138,9 @@ class App:
     def pump(self):
         try:
             self.drain_queue()
+            if self.term and not self.closing:
+                dlog("asked to quit by the system (SIGTERM / SIGHUP)")
+                self.close(confirm=False, fast=True)
         finally:
             self.root.after(100, self.pump)
 
@@ -2653,6 +3157,11 @@ class App:
             return
         port = self.num(self.v_webport, 9001, 1024, 65535)
         lan = self.v_weblan.get()
+        made = ""
+        if lan and not self.v_webpw.get().strip():         # other devices always need a password
+            made = new_password()
+            self.v_webpw.set(made)
+            self.save()
         err = self.web.start(port, lan, self.v_webpw.get())
         if err:
             self.log(err)
@@ -2670,7 +3179,7 @@ class App:
             lines = lines or [f"http://127.0.0.1:{port}   (no network address found)"]
 
             def show():
-                self.show_web_text("\n".join(lines))
+                self.show_web_text("\n".join(lines + ([f"Password (made for you, change it below): {made}"] if made else [])))
                 self.log("Web page running: " + "  ".join(l.split()[0] for l in lines))
             self.q.put(show)
         threading.Thread(target=work, daemon=True).start()
@@ -2684,7 +3193,11 @@ class App:
         if "out" in d:
             out = str(d["out"]).strip()
             full = os.path.normpath(os.path.expanduser(out))
-            if not out or not (os.path.isdir(full) or os.path.isdir(os.path.dirname(full))):
+            try:
+                ok = bool(out) and run_bounded(lambda: os.path.isdir(full) or os.path.isdir(os.path.dirname(full)), 5)
+            except OSError as e:
+                raise WebError(400, f"Can't check that folder: {e}")
+            if not ok:
                 raise WebError(400, "That folder doesn't exist on the recorder's computer.")
             self.v_out.set(out)
         for key, var, lo, hi in (("pre", self.v_pre, 0, 60), ("post", self.v_post, 0, 120)):
@@ -2710,16 +3223,10 @@ class App:
         self.last_plan = 0
 
     def web_state(self):
-        def job_size(j):
-            try:
-                return os.path.getsize(j.file) if j.file else 0
-            except OSError:
-                return 0
-
         nowdt = now()
         jobs = [{"id": str(id(j)), "label": j.label, "channel": CHANNELS.get(j.ch, str(j.ch)),
                  "state": "reconnecting" if (j.state == "recording" and j.retrying) else j.state,
-                 "recorded": int(j.rec_time()), "part": j.part, "size": round(job_size(j) / 1e6, 1),
+                 "recorded": int(j.rec_time()), "part": j.part, "size": round(j.size / 1e6, 1),
                  "until": f"{j.end_at:%H:%M}" if j.end_at else (f"stops after {j.limit // 60} min" if j.limit else "until stopped")}
                 for j in self.jobs]
         rows, pre, post = self.plan(nowdt)
@@ -2840,6 +3347,9 @@ class App:
                 dlog(f"[{j.label}] error in the recording's own tick:\n" + traceback.format_exc(), logging.ERROR)
         self.jobs = [j for j in self.jobs if j.state != "done" or time.monotonic() - j.done_at < 60]
         self.draw_jobs()
+        self.check_raise()
+        if self.closing:
+            return
         if not self.fetching and time.time() - self.sched_time > 3 * 3600 and time.time() > self.retry_sched:
             self.refresh_schedule()
         if self.sched_time and not self.fetching:
@@ -2868,10 +3378,18 @@ class App:
             if iid not in live:
                 self.jtree.delete(iid)
 
-    def close(self):
-        if any(j.state != "done" for j in self.jobs) and not messagebox.askyesno(
+    def close(self, confirm=True, fast=False):
+        """Quit. `fast` (logout, shutdown, SIGTERM): no question, no .mkv conversion, and don't wait long."""
+        if self.closing:
+            if fast:
+                self.quit_now()
+            return
+        if confirm and any(j.state != "done" for j in self.jobs) and not messagebox.askyesno(
                 "TVMi Recorder", "Recordings are running. Stop them and quit?"):
             return
+        self.closing = True
+        if fast:
+            self.quit_now()
         running = sum(1 for j in self.jobs if j.state != "done" and not j.test)
         for j in self.jobs:
             j.stop(user="quit")
@@ -2880,13 +3398,61 @@ class App:
         self.notifier.send("app", "⚪ TVMi Recorder stopped", GREY,
                            f"{running} recording{'s were' if running != 1 else ' was'} still running and {'were' if running != 1 else 'was'} stopped."
                            if running else "The app was closed. Nothing was recording.")
-        for t in self.reapers:
-            t.join()
-        self.notifier.flush(8)
+        self.finish_closing(time.monotonic())
+
+    def quit_now(self):
+        """Stop waiting for .mkv conversions: the .ts files are kept."""
+        self.fast_quit = True
+        for p in list(self.converting):
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+    def finish_closing(self, started, box=None):
+        """Wait for recordings to finish (and be converted) without freezing the window, then exit."""
+        alive = [t for t in self.reapers if t.is_alive()]
+        waited = time.monotonic() - started
+        if (alive and not (self.fast_quit and waited > 20)) or (self.notifier.q.unfinished_tasks and waited < 8):
+            if alive and box is None and waited > 1:
+                box = self.closing_box()
+            if box is not None:
+                box[1].set(f"Finishing {len(alive)} recording(s)" + (", converting to .mkv…" if self.converting else "…")
+                           if alive else "Sending notifications…")
+            self.root.after(300, lambda: self.finish_closing(started, box))
+            return
+        INSTANCE.release()
         self.root.destroy()
+
+    def closing_box(self):
+        top = tk.Toplevel(self.root)
+        top.title("TVMi Recorder")
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)
+        text = tk.StringVar()
+        ttk.Label(top, textvariable=text, padding=(16, 14, 16, 4)).pack(anchor="w")
+        ttk.Label(top, foreground="gray40", padding=(16, 0, 16, 8), wraplength=360, justify="left",
+                  text="The app closes by itself when this is done. Quit now keeps the .ts files unconverted.").pack(anchor="w")
+        ttk.Button(top, text="Quit now", command=self.quit_now).pack(pady=(0, 12))
+        top.transient(self.root)
+        return top, text
+
+
+INSTANCE = InstanceLock(LOCK_FILE)
 
 
 def main():
+    if not INSTANCE.acquire():
+        # Already running (often: started at login, then opened from the menu). Show that copy instead. When this
+        # copy was itself started at login, there's nothing to show.
+        if "--minimized" not in sys.argv:
+            try:
+                with open(RAISE_FILE, "w", encoding="utf-8") as f:
+                    f.write(str(time.time()))
+            except OSError:
+                pass
+        dlog("another copy is already running; not starting a second one")
+        return
     root = tk.Tk()
     App(root)
     if "--minimized" in sys.argv:
