@@ -240,6 +240,59 @@ class Conversion(unittest.TestCase):
             self.assertFalse(M.conversion_ok(probe, ts, short))
 
 
+class Pending(unittest.TestCase):
+    def test_list_survives_and_shrinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            a = M.PendingMkv(path)
+            a.add(["/x/a.ts", "/x/b.ts"], True, "Show")
+            a.add(["/x/a.ts"], False, "Show")                  # already listed: not twice
+            b = M.PendingMkv(path)                             # as read by the next start
+            self.assertEqual([x["ts"] for x in b.items()], ["/x/a.ts", "/x/b.ts"])
+            b.remove("/x/a.ts")
+            b.remove("/x/a.ts")
+            self.assertEqual([x["ts"] for x in a.items()], ["/x/b.ts"])
+            b.remove("/x/b.ts")
+            self.assertFalse(os.path.exists(path))
+            with open(path, "w") as f:
+                f.write("not json")
+            self.assertEqual(a.items(), [])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg and ffprobe")
+class Leftovers(unittest.TestCase):
+    def test_next_start_converts_what_was_left(self):
+        with tempfile.TemporaryDirectory() as d:
+            ts, gone = os.path.join(d, "Show - 2026-11-13 2030.ts"), os.path.join(d, "gone.ts")
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=5",
+                            "-c:a", "aac", "-f", "mpegts", ts], check=True)
+            pending = M.PendingMkv(os.path.join(d, "pending.json"))
+            pending.add([ts, gone], True, "Show")
+            app = M.App.__new__(M.App)
+            app.ffmpeg, app.closing, app.fast_quit = shutil.which("ffmpeg"), False, False
+            app.q, app.reapers, app.converting, logged = queue.Queue(), [], set(), []
+            app.log = logged.append
+            with mock.patch.object(M, "PENDING", pending):
+                app.convert_leftovers().join(30)
+            self.assertTrue(os.path.exists(os.path.join(d, "Show - 2026-11-13 2030.mkv")))
+            self.assertFalse(os.path.exists(ts))               # "delete the .ts" was on when it was recorded
+            self.assertEqual(pending.items(), [])
+            self.assertEqual(app.converting, set())
+
+    def test_quitting_keeps_it_on_the_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            ts = os.path.join(d, "a.ts")
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=5",
+                            "-c:a", "aac", "-f", "mpegts", ts], check=True)
+            pending = M.PendingMkv(os.path.join(d, "pending.json"))
+            pending.add([ts], False, "A")
+            app = M.App.__new__(M.App)
+            app.ffmpeg, app.fast_quit, app.converting = shutil.which("ffmpeg"), True, set()
+            with mock.patch.object(M, "PENDING", pending), mock.patch.object(M, "remux_to_mkv", return_value=None):
+                self.assertEqual(app.convert_file(ts, False, "A", lambda m: None), "stopped")
+            self.assertEqual([x["ts"] for x in pending.items()], [ts])
+
+
 # ------------------------------------------------------------------ network guards
 class Guards(unittest.TestCase):
     def test_client_allowed(self):

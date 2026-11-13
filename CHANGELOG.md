@@ -24,7 +24,8 @@
 - **Recordings of radio and low-bitrate channels are converted to .mkv properly.** The check compared file sizes, which
   could reject a good .mkv. It now compares the length of the .mkv with the .ts.
 - **Quitting no longer freezes the window while recordings are converted.** It says what it is finishing and closes by
-  itself, and "Quit now" skips the remaining conversions (the .ts files are kept).
+  itself. "Quit now" stops the remaining conversions, and the app converts those recordings the next time it starts.
+  So do recordings left unconverted by a shutdown or a crash during conversion.
 - **Logging out, shutting down or killing the app no longer leaves ffmpeg recording on its own.** The app closes cleanly
   on SIGTERM and at logout without asking, and on Linux and Windows ffmpeg now stops if the app is killed.
 - **A slow or disconnected network drive no longer holds up the schedule.** Disk checks and ffmpeg probes run in the

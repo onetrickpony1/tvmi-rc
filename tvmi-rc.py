@@ -13,6 +13,7 @@ import concurrent.futures
 import datetime as dt
 import html
 import hmac
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -76,6 +77,7 @@ SCHEDULE_FILE = os.path.join(CFG, "schedule.json")
 LOG_FILE = os.path.join(CFG, "tvmi-recorder.log")
 LOCK_FILE = os.path.join(CFG, "running.lock")
 RAISE_FILE = os.path.join(CFG, "show-window")      # touched by a second copy: the running one shows its window
+PENDING_FILE = os.path.join(CFG, "pending-mkv.json")
 
 # Debug log: every message shown in the window, plus ffmpeg's own messages, exit codes, network
 # probes and errors. Rotates at 2 MB (keeps 3 old files). Session tokens are always blanked out.
@@ -269,6 +271,76 @@ def conversion_ok(ffprobe, src, dst):
     return os.path.getsize(dst) >= 0.5 * os.path.getsize(src)   # no ffprobe: only catch a clearly truncated file
 
 
+def remux_to_mkv(ffmpeg, ffprobe, src, track=None):
+    """Copy a .ts into a new .mkv next to it (lossless). Returns the .mkv's path, or None if it failed or was stopped;
+    the .ts is never touched. `track(proc, running)` lets the caller stop a conversion that is under way."""
+    stem = os.path.splitext(src)[0]
+    out, n = stem + ".mkv", 2
+    while os.path.exists(out):
+        out, n = f"{stem} ({n}).mkv", n + 1
+    tmp = out + ".partial"
+    p = subprocess.Popen([ffmpeg, "-loglevel", "error", "-y", "-i", src, "-map", "0:v?", "-map", "0:a?",
+                          "-c", "copy", "-f", "matroska", tmp],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         **({"creationflags": 0x08000000} if IS_WIN else {}))
+    if track:
+        track(p, True)
+    try:
+        p.wait()
+    finally:
+        if track:
+            track(p, False)
+    if p.returncode == 0 and conversion_ok(ffprobe, src, tmp):
+        os.replace(tmp, out)
+        return out
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    return None
+
+
+class PendingMkv:
+    """Recordings still to be converted to .mkv, kept in the config folder. A file goes on the list before its
+    conversion starts and comes off once converted (or if converting it fails). Whatever "Quit now", a shutdown or a
+    crash left behind is converted the next time the app starts."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+
+    def _read(self):
+        data = load_json(self.path, [])
+        return [x for x in data if isinstance(x, dict) and isinstance(x.get("ts"), str)] if isinstance(data, list) else []
+
+    def _write(self, items):
+        try:
+            if items:
+                save_json(self.path, items)
+            elif os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError as e:
+            dlog(f"couldn't update {self.path}: {e}", logging.WARNING)
+
+    def add(self, paths, delete, label):
+        with self.lock:
+            items = self._read()
+            have = {x["ts"] for x in items}
+            items += [{"ts": p, "delete": bool(delete), "label": label} for p in paths if p not in have]
+            self._write(items)
+
+    def remove(self, path):
+        with self.lock:
+            items = self._read()
+            left = [x for x in items if x["ts"] != path]
+            if len(left) != len(items):
+                self._write(left)
+
+    def items(self):
+        with self.lock:
+            return self._read()
+
+
+PENDING = PendingMkv(PENDING_FILE)
+
+
 class InstanceLock:
     """Only one copy of the app may run: two copies record every followed show twice and overwrite each other's
     settings. The lock is an OS file lock, so it goes away by itself if the app crashes."""
@@ -381,8 +453,7 @@ def tie_to_app(proc):
 # ------------------------------------------------------------------ TVMi access
 def _has_certifi():
     try:
-        import certifi  # noqa: F401
-        return True
+        return importlib.util.find_spec("certifi") is not None
     except Exception:
         return False
 
@@ -2089,6 +2160,7 @@ class App:
                            f"{' and recording ALL shows' if self.v_all.get() else ''}. "
                            f"Automatic recording is {'on' if self.v_auto.get() else 'off'}.")
         self.log("Ready. Keep this window open (minimised is fine): recordings only happen while it's running.")
+        root.after(5000, self.convert_leftovers)
         self.tick()
 
     def startup_facts(self):
@@ -2692,8 +2764,8 @@ class App:
         Returns a function to run in the background, or None for test recordings."""
         if job.test:
             return lambda: self.check_test(job)        # once the last chunks are in, so the length is right
-        convert = self.v_mkv.get() and bool(self.ffmpeg) and not self.fast_quit
-        delete, ffmpeg, ffprobe = self.v_del.get(), self.ffmpeg, find_ffprobe(self.ffmpeg)
+        convert = self.v_mkv.get() and bool(self.ffmpeg)    # quitting fast leaves them for the next start
+        delete = self.v_del.get()
         label = job.label
         facts = {"label": label, "channel": CHANNELS.get(job.ch, str(job.ch)), "recorded": job.elapsed,
                  "drops": job.drops.summary(), "outdir": job.outdir, "problem": job.problem,
@@ -2701,7 +2773,6 @@ class App:
                  "base": job.base, "engine": job.engine, "first_start": job.first_start, "end_wall": job.end_wall}
         facts_lag = lambda: job.max_lag
         say = lambda msg: self.q.put(lambda: self.log(msg))
-        kw = {"creationflags": 0x08000000} if IS_WIN else {}
 
         def run():
             # Take the file list NOW, not when the recording was stopped: at a scheduled end the built-in recorder keeps
@@ -2710,39 +2781,16 @@ class App:
             files = list(job.files)
             made, failed = {}, False
             if convert:
+                PENDING.add(files, delete, label)
                 for f in files:
-                    try:
-                        if not os.path.isfile(f) or os.path.getsize(f) < 20000:
-                            continue
-                        stem = os.path.splitext(f)[0]
-                        out, n = stem + ".mkv", 2
-                        while os.path.exists(out):
-                            out, n = f"{stem} ({n}).mkv", n + 1
-                        tmp = out + ".partial"
-                        if self.fast_quit:
-                            break
-                        p = subprocess.Popen([ffmpeg, "-loglevel", "error", "-y", "-i", f, "-map", "0:v?", "-map", "0:a?",
-                                              "-c", "copy", "-f", "matroska", tmp],
-                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
-                        self.converting.add(p)
-                        try:
-                            p.wait()
-                        finally:
-                            self.converting.discard(p)
-                        if p.returncode == 0 and conversion_ok(ffprobe, f, tmp):
-                            os.replace(tmp, out)
-                            made[f] = out
-                            if delete:
-                                os.remove(f)
-                            say(f"{label}: converted to {os.path.basename(out)}" + ("" if delete else " (.ts kept)"))
-                        else:
-                            failed = True
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                            say(f"{label}: .mkv conversion of {os.path.basename(f)} failed, the .ts was kept")
-                    except OSError as e:
+                    if self.fast_quit:
+                        say(f"{label}: not converted now; it will be converted to .mkv when the app next starts")
+                        break
+                    outcome = self.convert_file(f, delete, label, say)
+                    if outcome == "failed":
                         failed = True
-                        say(f"{label}: conversion problem ({e}); the .ts was kept")
+                    elif outcome not in (None, "stopped"):
+                        made[f] = outcome
             size = count = 0
             for f in files:
                 path = next((c for c in (f, made.get(f)) if c and os.path.exists(c)), None)
@@ -2759,6 +2807,58 @@ class App:
             if user != "quit":                       # closing the app: the "stopped" message covers it
                 self.notify_finished(facts, size, count)
         return run
+
+    def track_conversion(self, proc, running):
+        (self.converting.add if running else self.converting.discard)(proc)
+
+    def convert_file(self, f, delete, label, say):
+        """Convert one .ts and keep the to-do list in step. Returns the .mkv's path, "failed", "stopped" (quitting: it
+        stays on the list) or None (nothing to convert)."""
+        try:
+            if not os.path.isfile(f) or os.path.getsize(f) < 20000:
+                PENDING.remove(f)
+                return None
+            out = remux_to_mkv(self.ffmpeg, find_ffprobe(self.ffmpeg), f, self.track_conversion)
+            if out:
+                if delete:
+                    os.remove(f)
+                PENDING.remove(f)
+                say(f"{label}: converted to {os.path.basename(out)}" + ("" if delete else " (.ts kept)"))
+                return out
+            if self.fast_quit:
+                say(f"{label}: conversion of {os.path.basename(f)} stopped; it will be finished when the app next starts")
+                return "stopped"
+            say(f"{label}: .mkv conversion of {os.path.basename(f)} failed, the .ts was kept")
+        except OSError as e:
+            say(f"{label}: conversion problem ({e}); the .ts was kept")
+        PENDING.remove(f)
+        return "failed"
+
+    def convert_leftovers(self):
+        """At start-up: convert recordings that the last run didn't get to. Returns the worker thread, if any."""
+        if self.closing:
+            return None
+        todo = [x for x in PENDING.items() if os.path.isfile(x["ts"])]
+        for x in PENDING.items():
+            if x not in todo:
+                PENDING.remove(x["ts"])                    # moved or deleted since
+        if not todo:
+            return None
+        if not self.ffmpeg:
+            self.log(f"{len(todo)} recording(s) still need converting to .mkv, but ffmpeg wasn't found")
+            return None
+        self.log(f"Converting {len(todo)} recording(s) to .mkv that weren't converted last time")
+        say = lambda msg: self.q.put(lambda: self.log(msg))
+
+        def run():
+            for x in todo:
+                if self.fast_quit:
+                    break
+                self.convert_file(x["ts"], x.get("delete", False), x.get("label") or os.path.basename(x["ts"]), say)
+        t = threading.Thread(target=run)
+        t.start()
+        self.add_reaper(t)
+        return t
 
     def write_report(self, f, made):
         """A plain-text report next to the recordings whenever there were connection problems, even if nothing was lost.
@@ -3401,7 +3501,7 @@ class App:
         self.finish_closing(time.monotonic())
 
     def quit_now(self):
-        """Stop waiting for .mkv conversions: the .ts files are kept."""
+        """Stop waiting for .mkv conversions: the .ts files are kept and converted at the next start."""
         self.fast_quit = True
         for p in list(self.converting):
             try:
@@ -3432,7 +3532,8 @@ class App:
         text = tk.StringVar()
         ttk.Label(top, textvariable=text, padding=(16, 14, 16, 4)).pack(anchor="w")
         ttk.Label(top, foreground="gray40", padding=(16, 0, 16, 8), wraplength=360, justify="left",
-                  text="The app closes by itself when this is done. Quit now keeps the .ts files unconverted.").pack(anchor="w")
+                  text="The app closes by itself when this is done. Quit now keeps the .ts files and converts them "
+                       "the next time the app starts.").pack(anchor="w")
         ttk.Button(top, text="Quit now", command=self.quit_now).pack(pady=(0, 12))
         top.transient(self.root)
         return top, text
