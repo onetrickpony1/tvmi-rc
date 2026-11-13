@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 - 2026-11-13
 
 ### Features
 - **Schedules for every channel.** TVM, TVM+, TVMsport+, Magic, Radju Malta and Radju Malta 2 all have schedules now, so
