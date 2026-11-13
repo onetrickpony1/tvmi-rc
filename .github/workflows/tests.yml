@@ -18,6 +18,8 @@ jobs:
       - run: python -m py_compile tvmi-rc.py
       - name: imports cleanly
         run: python -c "import importlib.util as u; s=u.spec_from_file_location('m','tvmi-rc.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
 
   installer:
     strategy:
