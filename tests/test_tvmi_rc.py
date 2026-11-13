@@ -536,6 +536,7 @@ class Misc(unittest.TestCase):
             self.assertTrue(M._WinKillJob().add(p))
         finally:
             p.kill()
+            p.wait()
 
 
 if __name__ == "__main__":
